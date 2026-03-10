@@ -2,9 +2,9 @@ FROM python:3.12-slim
 
 ENV TZ=Europe/Prague
 
-# Install cron + timezone data
+# Install timezone data
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends cron tzdata && \
+    apt-get install -y --no-install-recommends tzdata && \
     ln -sf /usr/share/zoneinfo/$TZ /etc/localtime && \
     echo $TZ > /etc/timezone && \
     rm -rf /var/lib/apt/lists/*
@@ -20,8 +20,7 @@ COPY main.py .
 COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
 
-# Output directory for debug logs, JSON, and lockfiles
-# Must be a volume so lockfiles survive container restarts
+# Output directory for debug logs and JSON
 RUN mkdir -p /app/daily_questions
 VOLUME /app/daily_questions
 

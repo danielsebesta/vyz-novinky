@@ -6,7 +6,7 @@ import re
 import os
 import time
 import hashlib
-from collections import Counter
+from collections import Counter, OrderedDict
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
@@ -221,8 +221,19 @@ SESSION.headers.update({
     "Accept-Language": "cs,en;q=0.5",
 })
 
-# Scrape error tracking for diagnostics
-_scrape_errors: Counter = Counter()
+# Scrape error tracking for diagnostics — tracks per domain
+_scrape_errors: dict[str, Counter] = {}
+
+
+def _track_error(url: str, error_type: str):
+    """Record a scrape error for the given URL's domain."""
+    try:
+        domain = url.split("/")[2]
+    except (IndexError, AttributeError):
+        domain = "unknown"
+    if domain not in _scrape_errors:
+        _scrape_errors[domain] = Counter()
+    _scrape_errors[domain][error_type] += 1
 
 
 def scrape_article_text(url: str) -> str:
@@ -231,7 +242,7 @@ def scrape_article_text(url: str) -> str:
         res = SESSION.get(url, timeout=SCRAPE_TIMEOUT, allow_redirects=True)
         res.raise_for_status()
         if "text/html" not in res.headers.get("Content-Type", ""):
-            _scrape_errors["non_html"] += 1
+            _track_error(url, "non_html")
             return ""
         soup = BeautifulSoup(res.text, "html.parser")
         for tag in soup.find_all(["script", "style", "nav", "footer", "aside", "header", "form", "iframe"]):
@@ -241,16 +252,16 @@ def scrape_article_text(url: str) -> str:
         text = " ".join(t for t in texts if len(t) > 20)
         return text[:MAX_ARTICLE_CHARS] if MAX_ARTICLE_CHARS else text
     except requests.Timeout:
-        _scrape_errors["timeout"] += 1
+        _track_error(url, "timeout")
         return ""
     except requests.HTTPError as e:
-        _scrape_errors[f"http_{e.response.status_code}"] += 1
+        _track_error(url, f"http_{e.response.status_code}")
         return ""
     except requests.ConnectionError:
-        _scrape_errors["connection"] += 1
+        _track_error(url, "connection")
         return ""
     except Exception as e:
-        _scrape_errors[type(e).__name__] += 1
+        _track_error(url, type(e).__name__)
         return ""
 
 
@@ -305,7 +316,10 @@ def fetch_daily_news() -> str:
             results.append(result)
 
     if _scrape_errors:
-        log(f"  [INFO] Scrape errors: {dict(_scrape_errors)}")
+        total_errors = sum(sum(c.values()) for c in _scrape_errors.values())
+        log(f"  [INFO] Scrape errors: {total_errors} total across {len(_scrape_errors)} domains:")
+        for domain in sorted(_scrape_errors, key=lambda d: sum(_scrape_errors[d].values()), reverse=True):
+            log(f"    {domain}: {dict(_scrape_errors[domain])}")
 
     before = len(results)
     results = _title_dedup(results)
@@ -461,11 +475,48 @@ RULES:
 - Every fact from the input must appear in the output (unless it's a duplicate)."""
 
 
+def _merge_categorized_chunks(chunk_results: list[str]) -> str:
+    """Merge multiple categorized outputs by concatenating facts under each category header.
+    
+    Does simple text-based dedup (exact line match) without LLM — preserves all data.
+    """
+    categories: OrderedDict[str, list[str]] = OrderedDict()
+    current_cat = "## OSTATNÍ"
+    
+    for chunk_text in chunk_results:
+        for line in chunk_text.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                current_cat = stripped
+                if current_cat not in categories:
+                    categories[current_cat] = []
+            elif stripped.startswith("- ") and len(stripped) > 10:
+                if current_cat not in categories:
+                    categories[current_cat] = []
+                categories[current_cat].append(stripped)
+    
+    # Simple dedup: remove exact duplicate lines within each category
+    result_lines = []
+    for cat, facts in categories.items():
+        seen = set()
+        unique_facts = []
+        for fact in facts:
+            normalized = fact.lower().strip()
+            if normalized not in seen:
+                seen.add(normalized)
+                unique_facts.append(fact)
+        if unique_facts:
+            result_lines.append(f"\n{cat}")
+            result_lines.extend(unique_facts)
+    
+    return "\n".join(result_lines)
+
+
 def categorize_facts(raw_facts: str) -> str:
     """Categorize, deduplicate and prioritize extracted facts via gpt-5-mini."""
     log("[3/6] Categorizing & Prioritizing Facts...")
     
-    # Split into chunks if facts are very long (mini has smaller context)
+    # Split into chunks if facts are very long
     chunks: list[str] = []
     lines = raw_facts.split("\n")
     current_chunk: list[str] = []
@@ -482,64 +533,33 @@ def categorize_facts(raw_facts: str) -> str:
     if current_chunk:
         chunks.append("\n".join(current_chunk))
     
-    if len(chunks) == 1:
-        # Single chunk — categorize directly
-        log(f"  [INFO] Single chunk ({len(raw_facts):,} chars), categorizing...")
+    log(f"  [INFO] {len(chunks)} chunk(s), categorizing in parallel...")
+    
+    def categorize_chunk(idx, chunk):
         resp = api_call_with_retry(
             client.chat.completions.create,
             model=MINI_MODEL,
             messages=[
                 {"role": "system", "content": CATEGORIZE_SYSTEM_PROMPT},
-                {"role": "user", "content": f"Categorize and prioritize ALL these facts:\n\n{raw_facts}"},
+                {"role": "user", "content": f"Categorize and prioritize ALL these facts:\n\n{chunk}"},
             ],
             max_completion_tokens=16_000,
         )
-        result = resp.choices[0].message.content
-        if resp.usage:
-            log(f"  [INFO] Tokens: {resp.usage.total_tokens:,}")
-    else:
-        # Multiple chunks — categorize each, then merge
-        log(f"  [INFO] {len(chunks)} chunks, categorizing in parallel...")
-        
-        def categorize_chunk(idx, chunk):
-            resp = api_call_with_retry(
-                client.chat.completions.create,
-                model=MINI_MODEL,
-                messages=[
-                    {"role": "system", "content": CATEGORIZE_SYSTEM_PROMPT},
-                    {"role": "user", "content": f"Categorize and prioritize ALL these facts:\n\n{chunk}"},
-                ],
-                max_completion_tokens=16_000,
-            )
-            log(f"  [OK] Chunk {idx}/{len(chunks)} categorized.")
-            return resp.choices[0].message.content
+        log(f"  [OK] Chunk {idx}/{len(chunks)} categorized.")
+        return resp.choices[0].message.content
 
-        chunk_results: list[str] = ["" for _ in chunks]
-        with ThreadPoolExecutor(max_workers=min(10, len(chunks))) as pool:
-            futures = {pool.submit(categorize_chunk, idx, chunk): idx for idx, chunk in enumerate(chunks, 1)}
-            for future in as_completed(futures):
-                idx = futures[future]
-                try:
-                    chunk_results[idx - 1] = future.result()
-                except Exception as e:
-                    log(f"  [ERR] Categorize chunk {idx} error: {e}")
-        
-        combined = "\n\n".join(filter(None, chunk_results))
-        
-        # Final merge pass to deduplicate across chunks
-        log(f"  [INFO] Merging {len(chunks)} categorized chunks...")
-        resp = api_call_with_retry(
-            client.chat.completions.create,
-            model=MINI_MODEL,
-            messages=[
-                {"role": "system", "content": CATEGORIZE_SYSTEM_PROMPT + "\n\nADDITIONAL TASK: The input contains ALREADY CATEGORIZED facts from multiple chunks. Merge them into a SINGLE categorized list. Remove cross-chunk duplicates. Keep the most detailed version of each fact."},
-                {"role": "user", "content": f"Merge these categorized fact lists into one:\n\n{combined}"},
-            ],
-            max_completion_tokens=16_000,
-        )
-        result = resp.choices[0].message.content
-        if resp.usage:
-            log(f"  [INFO] Merge tokens: {resp.usage.total_tokens:,}")
+    chunk_results: list[str] = ["" for _ in chunks]
+    with ThreadPoolExecutor(max_workers=min(10, len(chunks))) as pool:
+        futures = {pool.submit(categorize_chunk, idx, chunk): idx for idx, chunk in enumerate(chunks, 1)}
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                chunk_results[idx - 1] = future.result()
+            except Exception as e:
+                log(f"  [ERR] Categorize chunk {idx} error: {e}")
+
+    # Merge in Python — no LLM, no data loss
+    result = _merge_categorized_chunks([c for c in chunk_results if c])
 
     # Count categories and facts
     categories = [l for l in result.split("\n") if l.strip().startswith("## ")]
@@ -632,8 +652,8 @@ RULES FOR PICK QUESTIONS:
 
 RULES FOR NUMBER QUESTIONS:
 - Answer is an INTEGER as string. wrongAnswers = [].
-- BANNED: 0, 1, 2 (trivial) and over 10 000 (unguessable).
-- IDEAL range: 3 - 10 000. Age, score, percentages, prices in thousands.
+- BANNED: 0, 1, 2 (trivial) and over 100 000 (unguessable).
+- IDEAL range: 3 - 100 000. Age, score, percentages, prices in thousands, attendance.
 
 STYLE & LANGUAGE:
 - ALL EXPORTED QUESTIONS AND ANSWERS MUST BE STRICTLY IN CZECH LANGUAGE.
@@ -721,7 +741,7 @@ def _validate_questions(questions: list[dict]) -> list[dict]:
                 num = float(q["correctAnswer"])
                 q["correctAnswer"] = str(int(round(num)))
                 num_int = int(q["correctAnswer"])
-                if num_int < 3 or num_int > 10000:
+                if num_int < 3 or num_int > 100_000:
                     log(f"  [WARN] Number out of bounds ({num_int}): {q['content'][:60]}...")
                     continue
             except (ValueError, TypeError):

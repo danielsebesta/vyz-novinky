@@ -578,10 +578,21 @@ def categorize_facts(raw_facts: str) -> str:
                 {"role": "system", "content": CATEGORIZE_SYSTEM_PROMPT},
                 {"role": "user", "content": f"Categorize and prioritize ALL these facts:\n\n{chunk}"},
             ],
-            max_completion_tokens=16_000,
+            max_completion_tokens=32_000,
         )
-        log(f"  [OK] Chunk {idx}/{len(chunks)} categorized.")
-        return resp.choices[0].message.content
+        content = resp.choices[0].message.content
+        finish = resp.choices[0].finish_reason
+        
+        if not content:
+            log(f"  [WARN] Chunk {idx}/{len(chunks)}: empty response (finish_reason={finish})")
+            return ""
+        
+        # Strip markdown code fences that LLM sometimes wraps output in
+        content = re.sub(r"^```(?:markdown|md)?\s*\n?", "", content)
+        content = re.sub(r"\n?```\s*$", "", content)
+        
+        log(f"  [OK] Chunk {idx}/{len(chunks)}: {len(content):,} chars (finish_reason={finish})")
+        return content
 
     chunk_results: list[str] = ["" for _ in chunks]
     with ThreadPoolExecutor(max_workers=min(10, len(chunks))) as pool:
@@ -596,17 +607,27 @@ def categorize_facts(raw_facts: str) -> str:
     # Merge in Python — no LLM, no data loss
     non_empty = [c for c in chunk_results if c]
     
+    if not non_empty:
+        log(f"  [WARN] All categorization chunks returned empty! Using raw facts.")
+        return raw_facts
+    
     # Debug: log first 200 chars of each chunk so we can see the format
     for i, c in enumerate(non_empty):
         preview = c[:200].replace("\n", " | ")
-        log(f"  [DEBUG] Chunk {i+1} preview: {preview}...")
+        log(f"  [DEBUG] Chunk {i+1}/{len(non_empty)} preview: {preview}...")
     
     result = _merge_categorized_chunks(non_empty)
 
     # Count categories and facts
-    categories = [l for l in result.split("\n") if l.strip().startswith("## ")]
+    categories_found = [l for l in result.split("\n") if l.strip().startswith("## ")]
     fact_lines = [l for l in result.split("\n") if l.strip().startswith("- ")]
-    log(f"  [OK] {len(fact_lines)} facts in {len(categories)} categories ({len(result):,} chars)")
+    log(f"  [OK] {len(fact_lines)} facts in {len(categories_found)} categories ({len(result):,} chars)")
+    
+    # Sanity check: if we lost too much data, fall back to raw facts
+    raw_bullet_count = raw_facts.count("\n- ")
+    if len(fact_lines) < 50 or (raw_bullet_count > 0 and len(fact_lines) < raw_bullet_count * 0.15):
+        log(f"  [WARN] Only {len(fact_lines)} facts survived (raw had ~{raw_bullet_count} bullets) — too few, using raw facts")
+        return raw_facts
     
     return result
 
@@ -1043,61 +1064,131 @@ def cleanup_old_questions(days_old: int = CLEANUP_DAYS) -> None:
         log(f"  [ERR] Fatal cleanup error: {type(e).__name__}: {e}")
 
 
-# Main Execution
-if __name__ == "__main__":
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+# ================= SCHEDULER =================
+SCHEDULE_HOUR = 12  # Prague time
+SCHEDULE_MINUTE = 0
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
+
+PRAGUE_TZ = ZoneInfo("Europe/Prague")
+
+
+def _next_run_time() -> datetime:
+    """Calculate the next scheduled run time (today or tomorrow at SCHEDULE_HOUR:SCHEDULE_MINUTE Prague time)."""
+    now = datetime.now(PRAGUE_TZ)
+    target = now.replace(hour=SCHEDULE_HOUR, minute=SCHEDULE_MINUTE, second=0, microsecond=0)
+    if now >= target:
+        target += timedelta(days=1)
+    return target
+
+
+def run_pipeline():
+    """Execute the full quiz pipeline once."""
+    global DEBUG_LOG_FILE
     today = datetime.now().strftime("%Y-%m-%d")
+    DEBUG_LOG_FILE = os.path.join(OUTPUT_DIR, f"debug_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log")
     start = time.time()
 
     log(f"=== Daily Quiz Pipeline - {today} ===")
     log(f"Debug log: {DEBUG_LOG_FILE}")
     preflight_check()
 
-    try:
-        raw = fetch_daily_news()
-        if not raw.strip():
-            log("[ERR] No fresh articles found.")
-            exit(1)
+    raw = fetch_daily_news()
+    if not raw.strip():
+        log("[ERR] No fresh articles found.")
+        return
 
-        with open(os.path.join(OUTPUT_DIR, f"debug_1_raw_articles_{today}.txt"), "w", encoding="utf-8") as f:
-            f.write(raw)
+    with open(os.path.join(OUTPUT_DIR, f"debug_1_raw_articles_{today}.txt"), "w", encoding="utf-8") as f:
+        f.write(raw)
 
-        facts = extract_facts(raw)
-        if not facts.strip():
-            log("[ERR] No facts extracted.")
-            exit(1)
+    facts = extract_facts(raw)
+    if not facts.strip():
+        log("[ERR] No facts extracted.")
+        return
 
-        with open(os.path.join(OUTPUT_DIR, f"debug_2_extracted_facts_{today}.txt"), "w", encoding="utf-8") as f:
-            f.write(facts)
+    with open(os.path.join(OUTPUT_DIR, f"debug_2_extracted_facts_{today}.txt"), "w", encoding="utf-8") as f:
+        f.write(facts)
 
-        categorized = categorize_facts(facts)
-        if not categorized.strip():
-            log("[ERR] Categorization produced no output, using raw facts.")
-            categorized = facts
+    categorized = categorize_facts(facts)
+    if not categorized.strip():
+        log("[ERR] Categorization produced no output, using raw facts.")
+        categorized = facts
 
-        with open(os.path.join(OUTPUT_DIR, f"debug_3_categorized_facts_{today}.txt"), "w", encoding="utf-8") as f:
-            f.write(categorized)
+    with open(os.path.join(OUTPUT_DIR, f"debug_3_categorized_facts_{today}.txt"), "w", encoding="utf-8") as f:
+        f.write(categorized)
 
-        questions = generate_questions(categorized)
+    questions = generate_questions(categorized)
 
-        out_file = os.path.join(OUTPUT_DIR, OUTPUT_FILENAME.format(date=today))
-        with open(out_file, "w", encoding="utf-8") as f:
-            json.dump({
-                "date": today,
-                "generated_at": datetime.now().isoformat(),
-                "questions": questions,
-            }, f, ensure_ascii=False, indent=2)
+    out_file = os.path.join(OUTPUT_DIR, OUTPUT_FILENAME.format(date=today))
+    with open(out_file, "w", encoding="utf-8") as f:
+        json.dump({
+            "date": today,
+            "generated_at": datetime.now().isoformat(),
+            "questions": questions,
+        }, f, ensure_ascii=False, indent=2)
 
-        log(f"  [INFO] Saved to {out_file}")
+    log(f"  [INFO] Saved to {out_file}")
 
-        upload_to_vyzyvatel(questions)
-        cleanup_old_questions()
+    upload_to_vyzyvatel(questions)
+    cleanup_old_questions()
 
-        log(f"=== Completed in {round(time.time() - start, 1)}s ===")
+    log(f"=== Completed in {round(time.time() - start, 1)}s ===")
 
-    except KeyboardInterrupt:
-        log("\n[WARN] Interrupted by user.")
-        exit(130)
-    except Exception as e:
-        log(f"[FATAL] Exception: {type(e).__name__}: {e}")
-        raise
+
+# Main Execution
+if __name__ == "__main__":
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    log(f"=== Quiz Scheduler Started ===")
+    log(f"Schedule: daily at {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d} Prague time")
+
+    def _today_lockfile() -> str:
+        return os.path.join(OUTPUT_DIR, f".last_run_{datetime.now(PRAGUE_TZ).strftime('%Y-%m-%d')}")
+
+    def _already_ran_today() -> bool:
+        return os.path.exists(_today_lockfile())
+
+    def _mark_ran_today():
+        # Create today's lockfile, clean up old ones
+        open(_today_lockfile(), "w").close()
+        for f in os.listdir(OUTPUT_DIR):
+            if f.startswith(".last_run_") and f != os.path.basename(_today_lockfile()):
+                try:
+                    os.remove(os.path.join(OUTPUT_DIR, f))
+                except OSError:
+                    pass
+
+    # Run immediately on first start — but only if not already done today
+    if _already_ran_today():
+        log(f"  [INFO] Already ran today (lockfile exists). Skipping to scheduler.")
+    else:
+        try:
+            run_pipeline()
+            _mark_ran_today()
+        except KeyboardInterrupt:
+            log("\n[WARN] Interrupted by user.")
+            exit(130)
+        except Exception as e:
+            log(f"[FATAL] Pipeline error: {type(e).__name__}: {e}")
+            # Don't exit — wait for next scheduled run
+
+    # Infinite scheduler loop
+    while True:
+        next_run = _next_run_time()
+        wait_seconds = (next_run - datetime.now(PRAGUE_TZ)).total_seconds()
+        log(f"=== Next run: {next_run.strftime('%Y-%m-%d %H:%M')} Prague time (sleeping {wait_seconds/3600:.1f}h) ===")
+
+        try:
+            time.sleep(max(0, wait_seconds))
+            run_pipeline()
+            _mark_ran_today()
+        except KeyboardInterrupt:
+            log("\n[WARN] Interrupted by user.")
+            exit(130)
+        except Exception as e:
+            log(f"[FATAL] Pipeline error: {type(e).__name__}: {e}")
+            # Don't exit — sleep and try again tomorrow
+            continue

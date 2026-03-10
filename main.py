@@ -478,24 +478,49 @@ RULES:
 def _merge_categorized_chunks(chunk_results: list[str]) -> str:
     """Merge multiple categorized outputs by concatenating facts under each category header.
     
-    Does simple text-based dedup (exact line match) without LLM — preserves all data.
+    Flexibly handles various LLM output formats:
+    - Headers: ## Title, # Title, ### Title, **Title**, ALL CAPS TITLE
+    - Bullets: - fact, * fact, • fact, 1. fact, 1) fact
+    Falls back to raw concatenation if parsing finds nothing.
     """
     categories: OrderedDict[str, list[str]] = OrderedDict()
     current_cat = "## OSTATNÍ"
     
+    # Regex for detecting headers
+    header_re = re.compile(
+        r"^(?:#{1,4}\s+(.+?)#*\s*$|"               # ## Header ## or ## Header
+        r"\*\*\s*(.+?)\s*\*\*\s*$|"                  # **Header**
+        r"([A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ ]{5,})\s*:?\s*$)"    # ALL CAPS HEADER (Czech)
+    )
+    # Regex for detecting bullet points
+    bullet_re = re.compile(r"^\s*(?:[-*•–]|\d+[.)]\s)\s*(.+)")
+    
     for chunk_text in chunk_results:
         for line in chunk_text.split("\n"):
             stripped = line.strip()
-            if stripped.startswith("## "):
-                current_cat = stripped
-                if current_cat not in categories:
-                    categories[current_cat] = []
-            elif stripped.startswith("- ") and len(stripped) > 10:
-                if current_cat not in categories:
-                    categories[current_cat] = []
-                categories[current_cat].append(stripped)
+            if not stripped:
+                continue
+            
+            # Try header match
+            header_match = header_re.match(stripped)
+            if header_match:
+                cat_name = next((g for g in header_match.groups() if g is not None), "").strip()
+                if cat_name:
+                    current_cat = f"## {cat_name.upper()}"
+                    if current_cat not in categories:
+                        categories[current_cat] = []
+                    continue
+            
+            # Try bullet match
+            bullet_match = bullet_re.match(stripped)
+            if bullet_match:
+                fact_text = bullet_match.group(1).strip()
+                if len(fact_text) > 10:
+                    if current_cat not in categories:
+                        categories[current_cat] = []
+                    categories[current_cat].append(f"- {fact_text}")
     
-    # Simple dedup: remove exact duplicate lines within each category
+    # Dedup within each category
     result_lines = []
     for cat, facts in categories.items():
         seen = set()
@@ -509,7 +534,17 @@ def _merge_categorized_chunks(chunk_results: list[str]) -> str:
             result_lines.append(f"\n{cat}")
             result_lines.extend(unique_facts)
     
-    return "\n".join(result_lines)
+    merged = "\n".join(result_lines)
+    
+    # Fallback: if parser found almost nothing, just concatenate raw chunks
+    total_input_lines = sum(1 for c in chunk_results for l in c.split("\n") if l.strip())
+    parsed_facts = sum(1 for l in result_lines if l.strip().startswith("- "))
+    
+    if parsed_facts < total_input_lines * 0.1 and total_input_lines > 20:
+        log(f"  [WARN] Parser only found {parsed_facts}/{total_input_lines} lines — format mismatch, using raw concatenation")
+        return "\n\n---\n\n".join(chunk_results)
+    
+    return merged
 
 
 def categorize_facts(raw_facts: str) -> str:
@@ -559,7 +594,14 @@ def categorize_facts(raw_facts: str) -> str:
                 log(f"  [ERR] Categorize chunk {idx} error: {e}")
 
     # Merge in Python — no LLM, no data loss
-    result = _merge_categorized_chunks([c for c in chunk_results if c])
+    non_empty = [c for c in chunk_results if c]
+    
+    # Debug: log first 200 chars of each chunk so we can see the format
+    for i, c in enumerate(non_empty):
+        preview = c[:200].replace("\n", " | ")
+        log(f"  [DEBUG] Chunk {i+1} preview: {preview}...")
+    
+    result = _merge_categorized_chunks(non_empty)
 
     # Count categories and facts
     categories = [l for l in result.split("\n") if l.strip().startswith("## ")]

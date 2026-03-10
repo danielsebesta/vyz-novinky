@@ -1,8 +1,12 @@
 FROM python:3.12-slim
 
-# Install cron
+ENV TZ=Europe/Prague
+
+# Install cron + timezone data
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends cron && \
+    apt-get install -y --no-install-recommends cron tzdata && \
+    ln -sf /usr/share/zoneinfo/$TZ /etc/localtime && \
+    echo $TZ > /etc/timezone && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -12,7 +16,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application
-COPY daily_quiz.py .
+COPY main.py .
 COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
 

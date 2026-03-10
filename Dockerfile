@@ -20,7 +20,9 @@ COPY main.py .
 COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
 
-# Output directory for debug logs and JSON
+# Output directory for debug logs, JSON, and lockfiles
+# Must be a volume so lockfiles survive container restarts
 RUN mkdir -p /app/daily_questions
+VOLUME /app/daily_questions
 
 CMD ["./entrypoint.sh"]

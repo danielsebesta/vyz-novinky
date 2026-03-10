@@ -57,15 +57,19 @@ SCRAPE_TIMEOUT = 8
 CHUNK_CHARS = 60_000
 MINI_MODEL = "gpt-5-mini"
 PREMIUM_MODEL = "gpt-5.4"
-NUM_PICK = 15
-NUM_NUMBER = 15
+NUM_PICK = 20
+NUM_NUMBER = 20
 OUTPUT_DIR = "daily_questions"
 OUTPUT_FILENAME = "questions_{date}.json"
 API_TIMEOUT = 300
 API_RETRIES = 3
 CLEANUP_DAYS = 7
+PREMIUM_TOKEN_BUDGET = 200_000  # Stay safely under 250K free limit
 
 client = OpenAI(api_key=OPENAI_API_KEY, timeout=API_TIMEOUT)
+
+# Track premium model token usage across calls
+_premium_tokens_used = 0
 
 
 def preflight_check():
@@ -262,7 +266,7 @@ def scrape_single_entry(entry) -> dict | None:
 
 def fetch_daily_news() -> str:
     """Download fresh articles from RSS feeds and format them as text."""
-    log("[1/5] Downloading fresh articles...")
+    log("[1/6] Downloading fresh articles...")
     cutoff = datetime.now(timezone.utc) - timedelta(hours=SCRAPE_HOURS_BACK)
     log(f"  [INFO] Articles since {cutoff.strftime('%Y-%m-%d %H:%M')} UTC ({SCRAPE_HOURS_BACK}h back)")
 
@@ -374,7 +378,7 @@ STRICT RULES:
 
 def extract_facts(raw_text: str) -> str:
     """Extract hard facts from articles via GPT chunking."""
-    log("[2/5] Fact Extraction...")
+    log("[2/6] Fact Extraction...")
     chunks: list[str] = []
     for i in range(0, len(raw_text), CHUNK_CHARS):
         chunk = raw_text[i : i + CHUNK_CHARS]
@@ -419,17 +423,153 @@ def extract_facts(raw_text: str) -> str:
     return merged
 
 
-# ================= STEP 3: QUESTION GENERATION =================
+# ================= STEP 3: CATEGORIZE & PRIORITIZE =================
+CATEGORIZE_SYSTEM_PROMPT = """\
+You are a news editor preparing material for a pub quiz. Your task is to take a raw list of facts and produce a STRUCTURED, CATEGORIZED, DEDUPLICATED summary.
+
+OUTPUT LANGUAGE: CZECH.
+
+PROCESS:
+1. Read ALL input facts from start to finish.
+2. Remove exact duplicates and near-duplicates (same event described differently — keep the most detailed version).
+3. Assign each fact to exactly one category.
+4. Within each category, sort facts by IMPACT and INTERESTINGNESS:
+   - TOP: Events affecting many people, shocking statistics, viral/bizarre incidents, major decisions, record-breaking numbers.
+   - BOTTOM: Routine events, minor updates, expected outcomes.
+
+MANDATORY CATEGORIES (use all that have facts):
+## POLITIKA
+## EKONOMIKA
+## SPORT
+## TECHNOLOGIE
+## KULTURA A MÉDIA
+## VĚDA A ZDRAVÍ
+## SPOLEČNOST A KRIMINALITA
+## SVĚT
+
+FORMAT:
+- Use Markdown headers (##) for categories.
+- Each fact is one bullet point starting with "- ".
+- Keep ALL meaningful facts — do NOT summarize or shorten them. Preserve names, numbers, places, dates.
+- Merge duplicates by combining details into one richer bullet point.
+- If a fact contains multiple distinct pieces of information, keep them together.
+
+RULES:
+- NO hallucinations. Do not add any information that is not in the input.
+- NO commentary, no introductions, no conclusions.
+- Preserve the EXACT nature of events (fire ≠ attack, death ≠ murder, resignation ≠ firing).
+- Every fact from the input must appear in the output (unless it's a duplicate)."""
+
+
+def categorize_facts(raw_facts: str) -> str:
+    """Categorize, deduplicate and prioritize extracted facts via gpt-5-mini."""
+    log("[3/6] Categorizing & Prioritizing Facts...")
+    
+    # Split into chunks if facts are very long (mini has smaller context)
+    chunks: list[str] = []
+    lines = raw_facts.split("\n")
+    current_chunk: list[str] = []
+    current_len = 0
+    
+    for line in lines:
+        line_len = len(line)
+        if current_len + line_len > CHUNK_CHARS and current_chunk:
+            chunks.append("\n".join(current_chunk))
+            current_chunk = []
+            current_len = 0
+        current_chunk.append(line)
+        current_len += line_len
+    if current_chunk:
+        chunks.append("\n".join(current_chunk))
+    
+    if len(chunks) == 1:
+        # Single chunk — categorize directly
+        log(f"  [INFO] Single chunk ({len(raw_facts):,} chars), categorizing...")
+        resp = api_call_with_retry(
+            client.chat.completions.create,
+            model=MINI_MODEL,
+            messages=[
+                {"role": "system", "content": CATEGORIZE_SYSTEM_PROMPT},
+                {"role": "user", "content": f"Categorize and prioritize ALL these facts:\n\n{raw_facts}"},
+            ],
+            max_completion_tokens=16_000,
+        )
+        result = resp.choices[0].message.content
+        if resp.usage:
+            log(f"  [INFO] Tokens: {resp.usage.total_tokens:,}")
+    else:
+        # Multiple chunks — categorize each, then merge
+        log(f"  [INFO] {len(chunks)} chunks, categorizing in parallel...")
+        
+        def categorize_chunk(idx, chunk):
+            resp = api_call_with_retry(
+                client.chat.completions.create,
+                model=MINI_MODEL,
+                messages=[
+                    {"role": "system", "content": CATEGORIZE_SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Categorize and prioritize ALL these facts:\n\n{chunk}"},
+                ],
+                max_completion_tokens=16_000,
+            )
+            log(f"  [OK] Chunk {idx}/{len(chunks)} categorized.")
+            return resp.choices[0].message.content
+
+        chunk_results: list[str] = ["" for _ in chunks]
+        with ThreadPoolExecutor(max_workers=min(10, len(chunks))) as pool:
+            futures = {pool.submit(categorize_chunk, idx, chunk): idx for idx, chunk in enumerate(chunks, 1)}
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    chunk_results[idx - 1] = future.result()
+                except Exception as e:
+                    log(f"  [ERR] Categorize chunk {idx} error: {e}")
+        
+        combined = "\n\n".join(filter(None, chunk_results))
+        
+        # Final merge pass to deduplicate across chunks
+        log(f"  [INFO] Merging {len(chunks)} categorized chunks...")
+        resp = api_call_with_retry(
+            client.chat.completions.create,
+            model=MINI_MODEL,
+            messages=[
+                {"role": "system", "content": CATEGORIZE_SYSTEM_PROMPT + "\n\nADDITIONAL TASK: The input contains ALREADY CATEGORIZED facts from multiple chunks. Merge them into a SINGLE categorized list. Remove cross-chunk duplicates. Keep the most detailed version of each fact."},
+                {"role": "user", "content": f"Merge these categorized fact lists into one:\n\n{combined}"},
+            ],
+            max_completion_tokens=16_000,
+        )
+        result = resp.choices[0].message.content
+        if resp.usage:
+            log(f"  [INFO] Merge tokens: {resp.usage.total_tokens:,}")
+
+    # Count categories and facts
+    categories = [l for l in result.split("\n") if l.strip().startswith("## ")]
+    fact_lines = [l for l in result.split("\n") if l.strip().startswith("- ")]
+    log(f"  [OK] {len(fact_lines)} facts in {len(categories)} categories ({len(result):,} chars)")
+    
+    return result
+
+
+# ================= STEP 4: QUESTION GENERATION =================
 def _build_quiz_prompt():
     now = datetime.now()
     return f"""\
-You are a creator of a DIFFICULT pub quiz for smart people. Today's date is {now.strftime("%d. %m. %Y")}. Facts are from fresh news.
+You are a creator of a DIFFICULT pub quiz for smart people. Today's date is {now.strftime("%d. %m. %Y")}. 
 
-Before generating, THINK step by step:
-1. Review all facts and select the most interesting and surprising ones.
-2. For each question, verify: "Could the correct answer be guessed WITHOUT reading the news?" - if YES, DISCARD it.
-3. Check if the answer IS NOT contained within the question - if YES, REPHRASE or DISCARD it.
-4. Only then, write the question down.
+The input contains CATEGORIZED FACTS from today's news, organized by category (## headers) with the most impactful facts listed first in each category. USE THIS STRUCTURE — pick questions from ALL categories.
+
+═══════════════════════════════════════════════
+★★★ CRITICAL: FULL COVERAGE ★★★
+═══════════════════════════════════════════════
+You MUST read the ENTIRE input from start to finish BEFORE generating any questions.
+DO NOT generate questions while reading — first read everything, then pick the best facts.
+
+The facts are organized into CATEGORIES with ## headers. You MUST use facts from ALL categories, not just the first few.
+
+MANDATORY PROCESS:
+1. Read ALL categories and ALL facts completely.
+2. From EACH category, identify the most surprising/specific facts with concrete details (numbers, names, places).
+3. Ensure you have candidate questions from every category before writing anything.
+4. Write questions, distributing them evenly across categories.
 
 QUANTITIES (strictly follow!):
 - EXACTLY {NUM_PICK}x "pick" (multiple choice from 4 options) - do these FIRST.
@@ -441,7 +581,19 @@ FORMAT:
 - number: correctAnswer is an INTEGER as a string (no decimals!). wrongAnswers = [].
 
 ═══════════════════════════════════════════════
-THE MOST IMPORTANT RULE - DIFFICULTY:
+CATEGORY BALANCE (MANDATORY — VIOLATION = FAILURE):
+═══════════════════════════════════════════════
+You MUST cover AT LEAST 6 different categories out of these 8:
+  sport, politics, economy, tech, culture/media, science, society/crime, world
+
+HARD LIMITS:
+- MAX 4 questions from any single category.
+- MIN 1 question from at least 6 categories.
+- PRIORITIZE events with large public impact: widely discussed stories, shocking statistics, major decisions affecting many people, viral/bizarre incidents. These make the best quiz questions because players are likely to have heard about them but not remember the details.
+- Do NOT exhaust your question budget on war/politics/economy alone. Spread it out.
+
+═══════════════════════════════════════════════
+DIFFICULTY:
 ═══════════════════════════════════════════════
 Questions MUST be HARD. Goal: average person answers max 30-40% correctly.
 A good question requires knowledge of a SPECIFIC detail from the text that a normal person wouldn't know.
@@ -468,8 +620,6 @@ A good question requires knowledge of a SPECIFIC detail from the text that a nor
 - Ask for a SPECIFIC detail: person's name, place name, exact number, specific result.
 - Ask about secondary details, not WHAT happened, but WHERE, WHEN, AT WHAT COST.
 
-═══════════════════════════════════════════════
-
 QUALITY RULES:
 - FACTUAL ACCURACY is CRITICAL. Do not mix up sports, names, disciplines.
 - NO YEARS IN QUESTIONS: Questions are daily, so current year is implied.
@@ -485,9 +635,6 @@ RULES FOR NUMBER QUESTIONS:
 - BANNED: 0, 1, 2 (trivial) and over 10 000 (unguessable).
 - IDEAL range: 3 - 10 000. Age, score, percentages, prices in thousands.
 
-CATEGORY BALANCE (MANDATORY):
-- MAX 3 questions from one category (sport/politics/economy/tech/culture/science/society).
-
 STYLE & LANGUAGE:
 - ALL EXPORTED QUESTIONS AND ANSWERS MUST BE STRICTLY IN CZECH LANGUAGE.
 - Concise, human, with humor where appropriate.
@@ -496,7 +643,8 @@ STYLE & LANGUAGE:
 FINAL CHECK (perform before submitting!):
 1. Is the answer enclosed right in the text of the question? -> YES means delete it.
 2. Could an average person guess it without reading news? -> YES means delete it.
-3. Does the question realistically have only 2 possible answers? -> YES means rephrase it."""
+3. Does the question realistically have only 2 possible answers? -> YES means rephrase it.
+4. Do I have questions from at least 6 different categories? -> NO means replace duplicates from overrepresented categories."""
 
 
 def _question_words(text: str) -> set[str]:
@@ -591,9 +739,12 @@ def _validate_questions(questions: list[dict]) -> list[dict]:
     return valid
 
 
-def _generate_gpt_questions(summary: str, quiz_prompt: str) -> list[dict]:
+def _generate_gpt_questions(summary: str, quiz_prompt: str, model: str = None) -> list[dict]:
     """Generate questions via GPT model."""
-    log(f"  [INFO] Generating questions using {PREMIUM_MODEL}...")
+    global _premium_tokens_used
+    if model is None:
+        model = PREMIUM_MODEL
+    log(f"  [INFO] Generating questions using {model}...")
     all_q: list[dict] = []
 
     for attempt in range(1, 4):
@@ -609,13 +760,13 @@ def _generate_gpt_questions(summary: str, quiz_prompt: str) -> list[dict]:
 
         resp = api_call_with_retry(
             client.beta.chat.completions.parse,
-            model=PREMIUM_MODEL,
+            model=model,
             messages=[
                 {"role": "system", "content": quiz_prompt},
                 {"role": "user", "content": prompt},
             ],
             response_format=QuizResponse,
-            max_completion_tokens=16_000,
+            max_completion_tokens=24_000,
             temperature=0.7,
         )
 
@@ -626,17 +777,22 @@ def _generate_gpt_questions(summary: str, quiz_prompt: str) -> list[dict]:
 
         new_q = [q.model_dump() for q in parsed.questions]
         if resp.usage:
-            log(f"  [INFO] GPT tokens used: {resp.usage.total_tokens:,}")
+            tokens = resp.usage.total_tokens
+            if model == PREMIUM_MODEL:
+                _premium_tokens_used += tokens
+            log(f"  [INFO] {model} tokens: {tokens:,} (premium budget: {_premium_tokens_used:,}/{PREMIUM_TOKEN_BUDGET:,})")
         all_q.extend(new_q)
         log(f"  [INFO] GPT: +{len(new_q)} -> total {len(all_q)}")
 
-    log(f"  [OK] GPT generated {len(all_q)} questions")
+    log(f"  [OK] {model} generated {len(all_q)} questions")
     return all_q
 
 
 def generate_questions(summary: str) -> list[dict]:
     """Generate, validate and backfill questions via GPT."""
-    log(f"[3/5] Generating Questions ({PREMIUM_MODEL})...")
+    global _premium_tokens_used
+    _premium_tokens_used = 0
+    log(f"[4/6] Generating Questions ({PREMIUM_MODEL}, budget: {PREMIUM_TOKEN_BUDGET:,} tokens)...")
     quiz_prompt = _build_quiz_prompt()
 
     judged = _generate_gpt_questions(summary, quiz_prompt)
@@ -645,22 +801,29 @@ def generate_questions(summary: str) -> list[dict]:
     final_pick = [q for q in validated if q["questionType"] == "pick"]
     final_num = [q for q in validated if q["questionType"] == "number"]
 
-    for backfill in range(1, 4):
+    for backfill in range(1, 7):
         need_p = NUM_PICK - len(final_pick)
         need_n = NUM_NUMBER - len(final_num)
         if need_p <= 0 and need_n <= 0:
             break
+
+        # Choose model: fall back to mini if premium budget is running low
+        if _premium_tokens_used >= PREMIUM_TOKEN_BUDGET:
+            backfill_model = MINI_MODEL
+            log(f"  [INFO] Premium budget exhausted ({_premium_tokens_used:,}/{PREMIUM_TOKEN_BUDGET:,}), falling back to {MINI_MODEL}")
+        else:
+            backfill_model = PREMIUM_MODEL
 
         parts = []
         if need_p > 0:
             parts.append(f"{need_p} pick")
         if need_n > 0:
             parts.append(f"{need_n} number")
-        log(f"  [INFO] Backfill {backfill}: missing {' + '.join(parts)}, generating...")
+        log(f"  [INFO] Backfill {backfill}/6: missing {' + '.join(parts)}, using {backfill_model}...")
 
         existing_topics = ', '.join(q['content'][:50] for q in final_pick + final_num)
         backfill_prompt = (
-            f"I still need {' and '.join(parts)} questions. "
+            f"I still need EXACTLY {' and '.join(parts)} questions. "
             f"Generate ONLY these, on DIFFERENT topics than what I already have: "
             f"{existing_topics}\n\n{summary}"
         )
@@ -668,15 +831,20 @@ def generate_questions(summary: str) -> list[dict]:
         try:
             resp = api_call_with_retry(
                 client.beta.chat.completions.parse,
-                model=PREMIUM_MODEL,
+                model=backfill_model,
                 messages=[
                     {"role": "system", "content": quiz_prompt},
                     {"role": "user", "content": backfill_prompt},
                 ],
                 response_format=QuizResponse,
-                max_completion_tokens=16_000,
+                max_completion_tokens=24_000,
                 temperature=0.7,
             )
+
+            if resp.usage and backfill_model == PREMIUM_MODEL:
+                _premium_tokens_used += resp.usage.total_tokens
+                log(f"  [INFO] Premium budget: {_premium_tokens_used:,}/{PREMIUM_TOKEN_BUDGET:,}")
+
             parsed = resp.choices[0].message.parsed
             if parsed is None:
                 continue
@@ -696,8 +864,17 @@ def generate_questions(summary: str) -> list[dict]:
         except Exception as e:
             log(f"  [ERR] Backfill error: {e}")
 
-    final = final_pick[:NUM_PICK] + final_num[:NUM_NUMBER]
-    log(f"  [OK] {len(final_pick[:NUM_PICK])} pick + {len(final_num[:NUM_NUMBER])} number = {len(final)} questions")
+    # Strict verification
+    final_pick = final_pick[:NUM_PICK]
+    final_num = final_num[:NUM_NUMBER]
+    final = final_pick + final_num
+
+    if len(final_pick) < NUM_PICK or len(final_num) < NUM_NUMBER:
+        log(f"  [WARN] TARGET NOT MET! Wanted {NUM_PICK}+{NUM_NUMBER}={NUM_PICK+NUM_NUMBER}, "
+            f"got {len(final_pick)}+{len(final_num)}={len(final)} after 6 backfill attempts")
+    else:
+        log(f"  [OK] Target met: {len(final_pick)} pick + {len(final_num)} number = {len(final)} questions")
+
     return final
 
 
@@ -707,7 +884,7 @@ def upload_to_vyzyvatel(questions: list[dict]) -> None:
         log("  [WARN] Vyzyvatel API key or Set ID not set, skipping upload.")
         return
 
-    log(f"[4/5] Uploading {len(questions)} questions to Vyzyvatel (Set ID: {VYZYVATEL_SET_ID})")
+    log(f"[5/6] Uploading {len(questions)} questions to Vyzyvatel (Set ID: {VYZYVATEL_SET_ID})")
 
     url = f"https://be.vyzyvatel.com/api/sets/{VYZYVATEL_SET_ID}/questions/batch"
     headers = {
@@ -746,7 +923,7 @@ def cleanup_old_questions(days_old: int = CLEANUP_DAYS) -> None:
         log("  [WARN] Vyzyvatel API key or Set ID not set, skipping cleanup.")
         return
 
-    log(f"[5/5] Cleaning up questions older than {days_old} days (Set ID: {VYZYVATEL_SET_ID})...")
+    log(f"[6/6] Cleaning up questions older than {days_old} days (Set ID: {VYZYVATEL_SET_ID})...")
 
     get_url = f"https://be.vyzyvatel.com/api/sets/{VYZYVATEL_SET_ID}/questions"
     delete_url = f"https://be.vyzyvatel.com/api/sets/{VYZYVATEL_SET_ID}/questions/batch"
@@ -831,7 +1008,15 @@ if __name__ == "__main__":
         with open(os.path.join(OUTPUT_DIR, f"debug_2_extracted_facts_{today}.txt"), "w", encoding="utf-8") as f:
             f.write(facts)
 
-        questions = generate_questions(facts)
+        categorized = categorize_facts(facts)
+        if not categorized.strip():
+            log("[ERR] Categorization produced no output, using raw facts.")
+            categorized = facts
+
+        with open(os.path.join(OUTPUT_DIR, f"debug_3_categorized_facts_{today}.txt"), "w", encoding="utf-8") as f:
+            f.write(categorized)
+
+        questions = generate_questions(categorized)
 
         out_file = os.path.join(OUTPUT_DIR, OUTPUT_FILENAME.format(date=today))
         with open(out_file, "w", encoding="utf-8") as f:

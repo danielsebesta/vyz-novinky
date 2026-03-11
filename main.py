@@ -17,11 +17,13 @@ from calendar import timegm
 
 # Configuration
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_API_KEY2 = os.environ.get("OPENAI_API_KEY2", "")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY environment variable is required")
 
 VYZYVATEL_API_KEY = os.environ.get("VYZYVATEL_API_KEY", "")
 VYZYVATEL_SET_ID = os.environ.get("VYZYVATEL_SET_ID", "5402")
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
 RSS_FEEDS = [
     "https://www.seznamzpravy.cz/rss",
@@ -64,28 +66,46 @@ OUTPUT_FILENAME = "questions_{date}.json"
 API_TIMEOUT = 300
 API_RETRIES = 3
 CLEANUP_DAYS = 7
-PREMIUM_TOKEN_BUDGET = 200_000  # Stay safely under 250K free limit
+PREMIUM_TOKEN_BUDGET = 200_000  # Stay safely under 250K free limit per key
 
-client = OpenAI(api_key=OPENAI_API_KEY, timeout=API_TIMEOUT)
+client1 = OpenAI(api_key=OPENAI_API_KEY, timeout=API_TIMEOUT)
+client2 = OpenAI(api_key=OPENAI_API_KEY2, timeout=API_TIMEOUT) if OPENAI_API_KEY2 else None
 
-# Track premium model token usage across calls
-_premium_tokens_used = 0
+# Track premium model token usage per client
+_token_usage = {"client1": 0, "client2": 0}
+
+
+def _get_client_and_name(prefer_secondary: bool = False) -> tuple:
+    """Return (client, name) — uses secondary if preferred and available."""
+    if prefer_secondary and client2 and _token_usage["client2"] < PREMIUM_TOKEN_BUDGET:
+        return client2, "client2"
+    if _token_usage["client1"] < PREMIUM_TOKEN_BUDGET:
+        return client1, "client1"
+    if client2 and _token_usage["client2"] < PREMIUM_TOKEN_BUDGET:
+        return client2, "client2"
+    # Both exhausted — return client1 anyway (will likely hit billing)
+    log(f"  [WARN] Both API key budgets exhausted! client1: {_token_usage['client1']:,}, client2: {_token_usage['client2']:,}")
+    return client1, "client1"
 
 
 def preflight_check():
-    """Verify OpenAI API connection."""
-    log("Checking API connection...")
+    """Verify OpenAI API connections."""
+    log("Checking API connections...")
 
-    for model in (PREMIUM_MODEL, MINI_MODEL):
-        try:
-            client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": "hi"}],
-                max_completion_tokens=5,
-            )
-            log(f"  [OK] OpenAI ({model})")
-        except Exception as e:
-            log(f"  [ERR] OpenAI ({model}) - {type(e).__name__}: {e}")
+    for name, c in [("client1", client1), ("client2", client2)]:
+        if c is None:
+            log(f"  [SKIP] {name} — no API key configured")
+            continue
+        for model in (PREMIUM_MODEL, MINI_MODEL):
+            try:
+                c.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": "hi"}],
+                    max_completion_tokens=5,
+                )
+                log(f"  [OK] {name} ({model})")
+            except Exception as e:
+                log(f"  [ERR] {name} ({model}) - {type(e).__name__}: {e}")
 
     log("")
 
@@ -410,7 +430,7 @@ def extract_facts(raw_text: str) -> str:
 
     def process_chunk(idx, chunk):
         resp = api_call_with_retry(
-            client.chat.completions.create,
+            client1.chat.completions.create,
             model=MINI_MODEL,
             messages=[
                 {"role": "system", "content": MINI_SYSTEM_PROMPT},
@@ -572,7 +592,7 @@ def categorize_facts(raw_facts: str) -> str:
     
     def categorize_chunk(idx, chunk):
         resp = api_call_with_retry(
-            client.chat.completions.create,
+            client1.chat.completions.create,
             model=MINI_MODEL,
             messages=[
                 {"role": "system", "content": CATEGORIZE_SYSTEM_PROMPT},
@@ -703,6 +723,32 @@ A good question requires knowledge of a SPECIFIC detail from the text that a nor
 - Ask for a SPECIFIC detail: person's name, place name, exact number, specific result.
 - Ask about secondary details, not WHAT happened, but WHERE, WHEN, AT WHAT COST.
 
+═══════════════════════════════════════════════
+★★★ MANDATORY: FULL CONTEXT IN EVERY QUESTION ★★★
+═══════════════════════════════════════════════
+Every question MUST be self-contained. A reader who hasn't seen the news must understand WHAT DOMAIN the question is about just from reading it.
+
+REQUIRED CONTEXT (include whichever apply):
+- SPORT: Always name the specific sport/discipline (football, ice hockey, tennis, biathlon...) and competition/league if relevant.
+- POLITICS: Name the country or institution.
+- ECONOMY: Name the company, sector, or country.
+- SCIENCE/TECH: Name the field or technology.
+- CULTURE: Name the medium (film, book, music, TV...).
+- CRIME/SOCIETY: Name the city/region and type of event.
+
+★ EXAMPLES:
+  ✗ "Jaké bylo skóre zápasu Sparta vs Plzeň?" (which sport??)
+  ✓ "Jaké bylo skóre fotbalového zápasu Sparta vs Plzeň v české lize?"
+
+  ✗ "Kdo vyhrál turnaj v Indian Wells?" (which sport??)
+  ✓ "Kdo vyhrál tenisový turnaj WTA v Indian Wells?"
+
+  ✗ "Kolik lidí zemřelo při útoku?" (where? what kind?)
+  ✓ "Kolik lidí zemřelo při raketovém útoku na Charkov na Ukrajině?"
+
+  ✗ "Jaký výsledek měl zápas s Finskem?" (what sport? what competition?)
+  ✓ "Jakým výsledkem skončil zápas české hokejové reprezentace s Finskem na Channel One Cupu?"
+
 QUALITY RULES:
 - FACTUAL ACCURACY is CRITICAL. Do not mix up sports, names, disciplines.
 - NO YEARS IN QUESTIONS: Questions are daily, so current year is implied.
@@ -727,7 +773,8 @@ FINAL CHECK (perform before submitting!):
 1. Is the answer enclosed right in the text of the question? -> YES means delete it.
 2. Could an average person guess it without reading news? -> YES means delete it.
 3. Does the question realistically have only 2 possible answers? -> YES means rephrase it.
-4. Do I have questions from at least 6 different categories? -> NO means replace duplicates from overrepresented categories."""
+4. Do I have questions from at least 6 different categories? -> NO means replace duplicates from overrepresented categories.
+5. Can the reader tell the domain/sport/country/field from the question alone? -> NO means add the missing context."""
 
 
 def _question_words(text: str) -> set[str]:
@@ -822,12 +869,10 @@ def _validate_questions(questions: list[dict]) -> list[dict]:
     return valid
 
 
-def _generate_gpt_questions(summary: str, quiz_prompt: str, model: str = None) -> list[dict]:
-    """Generate questions via GPT model."""
-    global _premium_tokens_used
-    if model is None:
-        model = PREMIUM_MODEL
-    log(f"  [INFO] Generating questions using {model}...")
+def _generate_gpt_questions(summary: str, quiz_prompt: str, use_secondary: bool = False) -> list[dict]:
+    """Generate questions via GPT model using available client."""
+    active_client, client_name = _get_client_and_name(prefer_secondary=use_secondary)
+    log(f"  [INFO] Generating questions using {PREMIUM_MODEL} via {client_name}...")
     all_q: list[dict] = []
 
     for attempt in range(1, 4):
@@ -842,8 +887,8 @@ def _generate_gpt_questions(summary: str, quiz_prompt: str, model: str = None) -
             prompt = summary
 
         resp = api_call_with_retry(
-            client.beta.chat.completions.parse,
-            model=model,
+            active_client.beta.chat.completions.parse,
+            model=PREMIUM_MODEL,
             messages=[
                 {"role": "system", "content": quiz_prompt},
                 {"role": "user", "content": prompt},
@@ -861,21 +906,21 @@ def _generate_gpt_questions(summary: str, quiz_prompt: str, model: str = None) -
         new_q = [q.model_dump() for q in parsed.questions]
         if resp.usage:
             tokens = resp.usage.total_tokens
-            if model == PREMIUM_MODEL:
-                _premium_tokens_used += tokens
-            log(f"  [INFO] {model} tokens: {tokens:,} (premium budget: {_premium_tokens_used:,}/{PREMIUM_TOKEN_BUDGET:,})")
+            _token_usage[client_name] += tokens
+            log(f"  [INFO] {client_name} tokens: {tokens:,} (budget: {_token_usage[client_name]:,}/{PREMIUM_TOKEN_BUDGET:,})")
         all_q.extend(new_q)
         log(f"  [INFO] GPT: +{len(new_q)} -> total {len(all_q)}")
 
-    log(f"  [OK] {model} generated {len(all_q)} questions")
+    log(f"  [OK] Generated {len(all_q)} questions via {client_name}")
     return all_q
 
 
 def generate_questions(summary: str) -> list[dict]:
     """Generate, validate and backfill questions via GPT."""
-    global _premium_tokens_used
-    _premium_tokens_used = 0
-    log(f"[4/6] Generating Questions ({PREMIUM_MODEL}, budget: {PREMIUM_TOKEN_BUDGET:,} tokens)...")
+    _token_usage["client1"] = 0
+    _token_usage["client2"] = 0
+    budget_info = f"2x {PREMIUM_TOKEN_BUDGET:,}" if client2 else f"{PREMIUM_TOKEN_BUDGET:,}"
+    log(f"[4/6] Generating Questions ({PREMIUM_MODEL}, budget: {budget_info} tokens)...")
     quiz_prompt = _build_quiz_prompt()
 
     judged = _generate_gpt_questions(summary, quiz_prompt)
@@ -890,19 +935,15 @@ def generate_questions(summary: str) -> list[dict]:
         if need_p <= 0 and need_n <= 0:
             break
 
-        # Choose model: fall back to mini if premium budget is running low
-        if _premium_tokens_used >= PREMIUM_TOKEN_BUDGET:
-            backfill_model = MINI_MODEL
-            log(f"  [INFO] Premium budget exhausted ({_premium_tokens_used:,}/{PREMIUM_TOKEN_BUDGET:,}), falling back to {MINI_MODEL}")
-        else:
-            backfill_model = PREMIUM_MODEL
-
+        # Pick best available client
+        active_client, client_name = _get_client_and_name(prefer_secondary=True)
+        
         parts = []
         if need_p > 0:
             parts.append(f"{need_p} pick")
         if need_n > 0:
             parts.append(f"{need_n} number")
-        log(f"  [INFO] Backfill {backfill}/6: missing {' + '.join(parts)}, using {backfill_model}...")
+        log(f"  [INFO] Backfill {backfill}/6: missing {' + '.join(parts)}, using {client_name}...")
 
         existing_topics = ', '.join(q['content'][:50] for q in final_pick + final_num)
         backfill_prompt = (
@@ -913,8 +954,8 @@ def generate_questions(summary: str) -> list[dict]:
 
         try:
             resp = api_call_with_retry(
-                client.beta.chat.completions.parse,
-                model=backfill_model,
+                active_client.beta.chat.completions.parse,
+                model=PREMIUM_MODEL,
                 messages=[
                     {"role": "system", "content": quiz_prompt},
                     {"role": "user", "content": backfill_prompt},
@@ -924,9 +965,9 @@ def generate_questions(summary: str) -> list[dict]:
                 temperature=0.7,
             )
 
-            if resp.usage and backfill_model == PREMIUM_MODEL:
-                _premium_tokens_used += resp.usage.total_tokens
-                log(f"  [INFO] Premium budget: {_premium_tokens_used:,}/{PREMIUM_TOKEN_BUDGET:,}")
+            if resp.usage:
+                _token_usage[client_name] += resp.usage.total_tokens
+                log(f"  [INFO] {client_name} budget: {_token_usage[client_name]:,}/{PREMIUM_TOKEN_BUDGET:,}")
 
             parsed = resp.choices[0].message.parsed
             if parsed is None:
@@ -1064,9 +1105,113 @@ def cleanup_old_questions(days_old: int = CLEANUP_DAYS) -> None:
         log(f"  [ERR] Fatal cleanup error: {type(e).__name__}: {e}")
 
 
-# ================= SCHEDULER =================
-SCHEDULE_HOUR = 12  # Prague time
-SCHEDULE_MINUTE = 0
+# ================= DISCORD WEBHOOK =================
+def send_discord_report(timings: dict, questions: list[dict], error_count: int, scrape_errors: dict, fact_count: int, category_count: int):
+    """Send a pipeline summary embed to Discord webhook."""
+    if not DISCORD_WEBHOOK_URL:
+        return
+    
+    today = datetime.now().strftime("%Y-%m-%d")
+    pick_count = sum(1 for q in questions if q["questionType"] == "pick")
+    number_count = sum(1 for q in questions if q["questionType"] == "number")
+    total_time = timings.get("total", 0)
+    
+    # Status
+    if len(questions) >= 40 and error_count == 0:
+        color = 0x2ECC71  # Green
+        status = "✅ Success"
+    elif len(questions) >= 35:
+        color = 0xF39C12  # Orange
+        status = "⚠️ Partial"
+    else:
+        color = 0xE74C3C  # Red
+        status = "❌ Failed"
+    
+    # Scrape error summary
+    scrape_lines = []
+    for domain, errors in sorted(scrape_errors.items(), key=lambda x: sum(x[1].values()), reverse=True):
+        scrape_lines.append(f"`{domain}`: {dict(errors)}")
+    scrape_text = "\n".join(scrape_lines[:5]) if scrape_lines else "None"
+    
+    # Token usage
+    token_lines = []
+    for name, used in _token_usage.items():
+        if name == "client2" and not client2:
+            continue
+        pct = round(used / PREMIUM_TOKEN_BUDGET * 100) if PREMIUM_TOKEN_BUDGET else 0
+        bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+        token_lines.append(f"`{name}`: {used:,} / {PREMIUM_TOKEN_BUDGET:,} ({pct}%) {bar}")
+    token_text = "\n".join(token_lines) if token_lines else "N/A"
+    
+    embed = {
+        "title": f"📰 Daily Quiz — {today}",
+        "color": color,
+        "fields": [
+            {
+                "name": "Status",
+                "value": status,
+                "inline": True,
+            },
+            {
+                "name": "Questions",
+                "value": f"**{len(questions)}**/40 ({pick_count} pick, {number_count} number)",
+                "inline": True,
+            },
+            {
+                "name": "Errors",
+                "value": str(error_count),
+                "inline": True,
+            },
+            {
+                "name": "⏱️ Timing",
+                "value": (
+                    f"Scraping: `{timings.get('scrape', 0):.0f}s`\n"
+                    f"Extraction: `{timings.get('extract', 0):.0f}s`\n"
+                    f"Categorization: `{timings.get('categorize', 0):.0f}s`\n"
+                    f"Generation: `{timings.get('generate', 0):.0f}s`\n"
+                    f"**Total: `{total_time:.0f}s` ({total_time/60:.1f}min)**"
+                ),
+                "inline": False,
+            },
+            {
+                "name": "📊 Data",
+                "value": f"Facts: {fact_count} in {category_count} categories",
+                "inline": True,
+            },
+            {
+                "name": "🔑 Token Usage (gpt-5.4)",
+                "value": token_text,
+                "inline": False,
+            },
+        ],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    
+    # Add scrape errors field only if there were errors
+    if scrape_lines:
+        embed["fields"].insert(5, {
+            "name": "🔴 Scrape Errors",
+            "value": scrape_text,
+            "inline": False,
+        })
+    
+    try:
+        resp = requests.post(
+            DISCORD_WEBHOOK_URL,
+            json={"embeds": [embed]},
+            timeout=10,
+        )
+        if resp.status_code in (200, 204):
+            log(f"  [OK] Discord notification sent.")
+        else:
+            log(f"  [ERR] Discord webhook: {resp.status_code} - {resp.text[:100]}")
+    except Exception as e:
+        log(f"  [ERR] Discord webhook error: {type(e).__name__}: {e}")
+SCHEDULE_HOUR = 11      # Pipeline starts at 11:45 Prague time
+SCHEDULE_MINUTE = 45
+PUBLISH_HOUR = 12       # Upload to Vyzyvatel at 12:00 Prague time
+PUBLISH_MINUTE = 0
+STATS_FILE = os.path.join(OUTPUT_DIR, "pipeline_stats.json")
 
 try:
     from zoneinfo import ZoneInfo
@@ -1085,42 +1230,140 @@ def _next_run_time() -> datetime:
     return target
 
 
+def _wait_until_publish_time():
+    """Sleep until PUBLISH_HOUR:PUBLISH_MINUTE Prague time. If already past, return immediately."""
+    now = datetime.now(PRAGUE_TZ)
+    target = now.replace(hour=PUBLISH_HOUR, minute=PUBLISH_MINUTE, second=0, microsecond=0)
+    wait = (target - now).total_seconds()
+    if wait > 0:
+        log(f"  [INFO] Questions ready. Waiting {wait:.0f}s until {PUBLISH_HOUR:02d}:{PUBLISH_MINUTE:02d} to publish...")
+        time.sleep(wait)
+    else:
+        log(f"  [INFO] Past publish time ({PUBLISH_HOUR:02d}:{PUBLISH_MINUTE:02d}), uploading immediately.")
+
+
+def _load_stats() -> dict:
+    """Load historical pipeline stats from JSON file."""
+    try:
+        with open(STATS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"runs": []}
+
+
+def _save_stats(stats: dict):
+    """Save pipeline stats, keeping last 30 runs."""
+    stats["runs"] = stats["runs"][-30:]
+    with open(STATS_FILE, "w", encoding="utf-8") as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+
+
+def _log_stats_summary(stats: dict):
+    """Log average and min/max times from historical runs."""
+    runs = stats.get("runs", [])
+    if len(runs) < 2:
+        return
+    
+    log(f"  [STATS] Historical averages ({len(runs)} runs):")
+    
+    for key, label in [
+        ("total", "Total pipeline"),
+        ("scrape", "Scraping"),
+        ("extract", "Fact extraction"),
+        ("categorize", "Categorization"),
+        ("generate", "Question generation"),
+    ]:
+        values = [r.get(key, 0) for r in runs if r.get(key)]
+        if not values:
+            continue
+        avg = sum(values) / len(values)
+        lo, hi = min(values), max(values)
+        log(f"    {label}: avg {avg:.0f}s | min {lo:.0f}s | max {hi:.0f}s")
+    
+    q_counts = [r.get("questions", 0) for r in runs if r.get("questions")]
+    if q_counts:
+        log(f"    Questions: avg {sum(q_counts)/len(q_counts):.1f} | min {min(q_counts)} | max {max(q_counts)}")
+    
+    err_counts = [r.get("errors", 0) for r in runs]
+    if err_counts:
+        log(f"    Errors per run: avg {sum(err_counts)/len(err_counts):.1f} | max {max(err_counts)}")
+
+
 def run_pipeline():
-    """Execute the full quiz pipeline once."""
+    """Execute the full quiz pipeline once with step timing."""
     global DEBUG_LOG_FILE
     today = datetime.now().strftime("%Y-%m-%d")
     DEBUG_LOG_FILE = os.path.join(OUTPUT_DIR, f"debug_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log")
-    start = time.time()
+    
+    timings = {}
+    error_count = 0
+    fact_count = 0
+    category_count = 0
+    questions = []
+    pipeline_start = time.time()
 
     log(f"=== Daily Quiz Pipeline - {today} ===")
     log(f"Debug log: {DEBUG_LOG_FILE}")
+    
+    # Load and show historical stats
+    stats = _load_stats()
+    _log_stats_summary(stats)
+    
     preflight_check()
 
+    # Step 1: Scrape
+    t = time.time()
     raw = fetch_daily_news()
+    timings["scrape"] = round(time.time() - t, 1)
+    log(f"  [TIME] Scraping: {timings['scrape']}s")
+    
     if not raw.strip():
         log("[ERR] No fresh articles found.")
+        error_count += 1
+        send_discord_report(timings, [], error_count, dict(_scrape_errors), 0, 0)
         return
 
     with open(os.path.join(OUTPUT_DIR, f"debug_1_raw_articles_{today}.txt"), "w", encoding="utf-8") as f:
         f.write(raw)
 
+    # Step 2: Extract facts
+    t = time.time()
     facts = extract_facts(raw)
+    timings["extract"] = round(time.time() - t, 1)
+    log(f"  [TIME] Fact extraction: {timings['extract']}s")
+    
     if not facts.strip():
         log("[ERR] No facts extracted.")
+        error_count += 1
+        send_discord_report(timings, [], error_count, dict(_scrape_errors), 0, 0)
         return
 
     with open(os.path.join(OUTPUT_DIR, f"debug_2_extracted_facts_{today}.txt"), "w", encoding="utf-8") as f:
         f.write(facts)
 
+    # Step 3: Categorize
+    t = time.time()
     categorized = categorize_facts(facts)
+    timings["categorize"] = round(time.time() - t, 1)
+    log(f"  [TIME] Categorization: {timings['categorize']}s")
+    
     if not categorized.strip():
         log("[ERR] Categorization produced no output, using raw facts.")
         categorized = facts
+        error_count += 1
+
+    # Count facts and categories from categorized output
+    fact_count = sum(1 for l in categorized.split("\n") if l.strip().startswith("- "))
+    category_count = sum(1 for l in categorized.split("\n") if l.strip().startswith("## "))
 
     with open(os.path.join(OUTPUT_DIR, f"debug_3_categorized_facts_{today}.txt"), "w", encoding="utf-8") as f:
         f.write(categorized)
 
+    # Step 4: Generate questions
+    t = time.time()
     questions = generate_questions(categorized)
+    timings["generate"] = round(time.time() - t, 1)
+    log(f"  [TIME] Question generation: {timings['generate']}s")
 
     out_file = os.path.join(OUTPUT_DIR, OUTPUT_FILENAME.format(date=today))
     with open(out_file, "w", encoding="utf-8") as f:
@@ -1129,13 +1372,62 @@ def run_pipeline():
             "generated_at": datetime.now().isoformat(),
             "questions": questions,
         }, f, ensure_ascii=False, indent=2)
-
     log(f"  [INFO] Saved to {out_file}")
 
+    # Wait for publish time (12:00) before uploading
+    _wait_until_publish_time()
+
+    # Step 5: Upload
+    t = time.time()
     upload_to_vyzyvatel(questions)
+    timings["upload"] = round(time.time() - t, 1)
+
+    # Step 6: Cleanup
     cleanup_old_questions()
 
-    log(f"=== Completed in {round(time.time() - start, 1)}s ===")
+    # Final summary
+    timings["total"] = round(time.time() - pipeline_start, 1)
+    pick_count = sum(1 for q in questions if q["questionType"] == "pick")
+    number_count = sum(1 for q in questions if q["questionType"] == "number")
+    
+    log(f"")
+    log(f"  ┌─────────────────────────────────────┐")
+    log(f"  │        PIPELINE SUMMARY              │")
+    log(f"  ├─────────────────────────────────────┤")
+    log(f"  │  Scraping:       {timings['scrape']:>7.1f}s           │")
+    log(f"  │  Extraction:     {timings['extract']:>7.1f}s           │")
+    log(f"  │  Categorization: {timings['categorize']:>7.1f}s           │")
+    log(f"  │  Generation:     {timings['generate']:>7.1f}s           │")
+    log(f"  │  Upload:         {timings.get('upload', 0):>7.1f}s           │")
+    log(f"  │  ─────────────────────────           │")
+    log(f"  │  TOTAL:          {timings['total']:>7.1f}s           │")
+    log(f"  │  Questions:  {pick_count:>3}p + {number_count:>3}n = {len(questions):>3}/40  │")
+    log(f"  │  Facts:      {fact_count:>4} in {category_count} categories  │")
+    log(f"  │  Errors:         {error_count:>4}                │")
+    for name, used in _token_usage.items():
+        if name == "client2" and not client2:
+            continue
+        log(f"  │  {name}: {used:>7,} / {PREMIUM_TOKEN_BUDGET:,} tkn │")
+    log(f"  └─────────────────────────────────────┘")
+    
+    # Save stats for historical tracking
+    run_stats = {
+        "date": today,
+        "questions": len(questions),
+        "errors": error_count,
+        "facts": fact_count,
+        "categories": category_count,
+        "tokens_client1": _token_usage["client1"],
+        "tokens_client2": _token_usage["client2"],
+        **timings,
+    }
+    stats["runs"].append(run_stats)
+    _save_stats(stats)
+    
+    # Send Discord notification
+    send_discord_report(timings, questions, error_count, dict(_scrape_errors), fact_count, category_count)
+    
+    log(f"=== Completed at {datetime.now(PRAGUE_TZ).strftime('%H:%M:%S')} Prague time ===")
 
 
 # Main Execution
@@ -1143,7 +1435,7 @@ if __name__ == "__main__":
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     log(f"=== Quiz Scheduler Started ===")
-    log(f"Schedule: daily at {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d} Prague time")
+    log(f"Schedule: pipeline at {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d}, publish at {PUBLISH_HOUR:02d}:{PUBLISH_MINUTE:02d} Prague time")
 
     def _today_lockfile() -> str:
         return os.path.join(OUTPUT_DIR, f".last_run_{datetime.now(PRAGUE_TZ).strftime('%Y-%m-%d')}")
@@ -1152,7 +1444,6 @@ if __name__ == "__main__":
         return os.path.exists(_today_lockfile())
 
     def _mark_ran_today():
-        # Create today's lockfile, clean up old ones
         open(_today_lockfile(), "w").close()
         for f in os.listdir(OUTPUT_DIR):
             if f.startswith(".last_run_") and f != os.path.basename(_today_lockfile()):
@@ -1173,7 +1464,6 @@ if __name__ == "__main__":
             exit(130)
         except Exception as e:
             log(f"[FATAL] Pipeline error: {type(e).__name__}: {e}")
-            # Don't exit — wait for next scheduled run
 
     # Infinite scheduler loop
     while True:
@@ -1190,5 +1480,4 @@ if __name__ == "__main__":
             exit(130)
         except Exception as e:
             log(f"[FATAL] Pipeline error: {type(e).__name__}: {e}")
-            # Don't exit — sleep and try again tomorrow
             continue

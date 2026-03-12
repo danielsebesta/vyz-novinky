@@ -1208,7 +1208,7 @@ def send_discord_report(timings: dict, questions: list[dict], error_count: int, 
     except Exception as e:
         log(f"  [ERR] Discord webhook error: {type(e).__name__}: {e}")
 SCHEDULE_HOUR = 11      # Pipeline starts at 11:45 Prague time
-SCHEDULE_MINUTE = 45
+SCHEDULE_MINUTE = 10
 PUBLISH_HOUR = 12       # Upload to Vyzyvatel at 12:00 Prague time
 PUBLISH_MINUTE = 0
 STATS_FILE = os.path.join(OUTPUT_DIR, "pipeline_stats.json")

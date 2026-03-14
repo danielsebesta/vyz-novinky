@@ -1789,7 +1789,7 @@ def run_dry_test():
 
     # 5. Vyzyvatel API
     log("[5/5] Vyzyvatel API...")
-    if VYZYVATEL_API_KEY:
+    if VYZYVATEL_API_KEY and VYZYVATEL_SET_ID:
         try:
             vyz_url = f"https://be.vyzyvatel.com/api/sets/{VYZYVATEL_SET_ID}/questions"
             headers = {"Authorization": f"Bearer {VYZYVATEL_API_KEY}"}
@@ -1805,7 +1805,7 @@ def run_dry_test():
             log(f"  [ERR] Vyzyvatel: {type(e).__name__}: {e}")
             errors += 1
     else:
-        log("  [SKIP] No VYZYVATEL_API_KEY")
+        log("  [SKIP] Missing VYZYVATEL_API_KEY or VYZYVATEL_SET_ID")
 
     # Summary
     log(f"\n=== DRY RUN COMPLETE — {errors} error(s) ===")

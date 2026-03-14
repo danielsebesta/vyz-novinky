@@ -334,6 +334,19 @@ def _write_wg_conf() -> bool:
         return False
     try:
         conf = base64.b64decode(WG_CONF_BASE64).decode()
+        # wireproxy expects CIDR notation for addresses (e.g. /32, /128)
+        import re as _re
+        def _fix_cidr(m):
+            addr = m.group(1).strip()
+            parts = [a.strip() for a in addr.split(",")]
+            fixed = []
+            for p in parts:
+                if "/" not in p:
+                    fixed.append(f"{p}/32" if ":" not in p else f"{p}/128")
+                else:
+                    fixed.append(p)
+            return f"Address = {', '.join(fixed)}"
+        conf = _re.sub(r"Address\s*=\s*(.+)", _fix_cidr, conf)
         # wireproxy needs a [Socks5] section to open the SOCKS5 proxy port
         if "[Socks5]" not in conf and "[socks5]" not in conf.lower():
             conf += f"\n\n[Socks5]\nBindAddress = {PROXY_HOST}:{PROXY_PORT}\n"

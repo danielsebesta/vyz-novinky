@@ -1746,28 +1746,29 @@ def update_discord_dashboard(stats: dict):
         return
 
     runs = stats.get("runs", [])[-7:]
-    if not runs:
-        return
 
-    # Build runs table
-    lines = []
-    for run in reversed(runs):
-        date = run.get("date", "?")
-        q_total = run.get("questions", 0)
-        status = "✅" if q_total >= 40 else "⚠️" if q_total >= 35 else "❌"
-        total_time = run.get("total", 0)
-        t1 = run.get("tokens_client1", 0)
-        t2 = run.get("tokens_client2", 0)
-        lines.append(
-            f"{status} **{date}** | {q_total}/40 | "
-            f"{total_time:.0f}s | "
-            f"t1:{t1:,} t2:{t2:,}"
-        )
-
-    # Average stats
-    avg_questions = sum(r.get("questions", 0) for r in runs) / len(runs)
-    avg_time = sum(r.get("total", 0) for r in runs) / len(runs)
-    success_rate = sum(1 for r in runs if r.get("questions", 0) >= 40) / len(runs) * 100
+    if runs:
+        lines = []
+        for run in reversed(runs):
+            date = run.get("date", "?")
+            q_total = run.get("questions", 0)
+            status = "✅" if q_total >= 40 else "⚠️" if q_total >= 35 else "❌"
+            total_time = run.get("total", 0)
+            t1 = run.get("tokens_client1", 0)
+            t2 = run.get("tokens_client2", 0)
+            lines.append(
+                f"{status} **{date}** | {q_total}/40 | "
+                f"{total_time:.0f}s | "
+                f"t1:{t1:,} t2:{t2:,}"
+            )
+        avg_questions = sum(r.get("questions", 0) for r in runs) / len(runs)
+        avg_time = sum(r.get("total", 0) for r in runs) / len(runs)
+        success_rate = sum(1 for r in runs if r.get("questions", 0) >= 40) / len(runs) * 100
+    else:
+        lines = ["No runs yet — waiting for first pipeline run"]
+        avg_questions = 0
+        avg_time = 0
+        success_rate = 0
 
     embed = {
         "title": "📊 Quiz Pipeline Dashboard",

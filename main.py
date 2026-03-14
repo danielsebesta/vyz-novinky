@@ -329,12 +329,16 @@ def _track_error(url: str, error_type: str):
 
 
 def _write_wg_conf() -> bool:
-    """Decode WG_CONF_BASE64 env var and write to temp file."""
+    """Decode WG_CONF_BASE64 env var and write wireproxy config file."""
     if not WG_CONF_BASE64:
         return False
     try:
+        conf = base64.b64decode(WG_CONF_BASE64).decode()
+        # wireproxy needs a [Socks5] section to open the SOCKS5 proxy port
+        if "[Socks5]" not in conf and "[socks5]" not in conf.lower():
+            conf += f"\n\n[Socks5]\nBindAddress = {PROXY_HOST}:{PROXY_PORT}\n"
         with open(WG_CONF_FILE, "w") as f:
-            f.write(base64.b64decode(WG_CONF_BASE64).decode())
+            f.write(conf)
         return True
     except Exception as e:
         log(f"  [WARN] Failed to write wg.conf: {e}")
@@ -504,16 +508,57 @@ def scrape_single_entry(entry) -> dict | None:
     return None
 
 
+SEEN_URLS_FILE = os.path.join(OUTPUT_DIR, "seen_urls.json")
+
+
+def _load_seen_urls() -> set:
+    """Load previously scraped article URLs (kept for 3 days)."""
+    try:
+        with open(SEEN_URLS_FILE, "r") as f:
+            data = json.load(f)
+        cutoff = time.time() - 3 * 86400
+        # Filter out entries older than 3 days
+        fresh = {url: ts for url, ts in data.items() if ts > cutoff}
+        return set(fresh.keys())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return set()
+
+
+def _save_seen_urls(urls: set):
+    """Save scraped article URLs with timestamps."""
+    try:
+        existing = {}
+        try:
+            with open(SEEN_URLS_FILE, "r") as f:
+                existing = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+        now = time.time()
+        for url in urls:
+            if url not in existing:
+                existing[url] = now
+        # Prune entries older than 3 days
+        cutoff = now - 3 * 86400
+        pruned = {u: t for u, t in existing.items() if t > cutoff}
+        with open(SEEN_URLS_FILE, "w") as f:
+            json.dump(pruned, f)
+    except Exception:
+        pass
+
+
 def fetch_daily_news() -> str:
     """Download fresh articles from RSS feeds and format them as text."""
     log("[1/6] Downloading fresh articles...")
     cutoff = datetime.now(timezone.utc) - timedelta(hours=SCRAPE_HOURS_BACK)
     log(f"  [INFO] Articles since {cutoff.strftime('%Y-%m-%d %H:%M')} UTC ({SCRAPE_HOURS_BACK}h back)")
 
-    # Start wireproxy for fallback scraping
     start_wireproxy()
 
+    seen_urls = _load_seen_urls()
+    log(f"  [INFO] {len(seen_urls)} previously seen article URLs loaded")
+
     entries_to_scrape = []
+    skipped_seen = 0
     for url in RSS_FEEDS:
         source = url.split("/")[2]
         try:
@@ -525,12 +570,20 @@ def fetch_daily_news() -> str:
             recent = [e for e in feed.entries if is_recent(e, cutoff)]
             if MAX_ENTRIES_PER_FEED:
                 recent = recent[:MAX_ENTRIES_PER_FEED]
-            log(f"  [OK] {source}: {len(recent)}/{len(feed.entries)}")
-            entries_to_scrape.extend(recent)
+            # Skip articles we've already processed in previous runs
+            fresh = []
+            for e in recent:
+                link = e.get("link", "")
+                if link in seen_urls:
+                    skipped_seen += 1
+                else:
+                    fresh.append(e)
+            log(f"  [OK] {source}: {len(fresh)}/{len(feed.entries)} (skipped {len(recent) - len(fresh)} seen)")
+            entries_to_scrape.extend(fresh)
         except Exception as e:
             log(f"  [ERR] {source}: {e}")
 
-    log(f"  [INFO] {len(entries_to_scrape)} articles to download...")
+    log(f"  [INFO] {len(entries_to_scrape)} new articles to download (skipped {skipped_seen} already seen)")
 
     _scrape_errors.clear()
     results: list[dict] = []
@@ -559,6 +612,10 @@ def fetch_daily_news() -> str:
     before = len(results)
     results = _title_dedup(results)
     log(f"  [INFO] {before} articles -> {len(results)} after deduplication (content + title)")
+
+    # Save all processed URLs for cross-run dedup
+    new_urls = {e.get("link", "") for e in entries_to_scrape if e.get("link")}
+    _save_seen_urls(new_urls)
 
     data = "\n\n".join(f"TITLE: {r['title']}\nCONTENT: {r['content']}\n---" for r in results)
     log(f"  [INFO] {len(data):,} characters gathered")

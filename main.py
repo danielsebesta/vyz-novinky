@@ -1905,7 +1905,18 @@ def run_dry_test():
     else:
         log("  [SKIP] Missing VYZYVATEL_API_KEY or VYZYVATEL_SET_ID")
 
-    # Summary
+    # 6. Discord dashboard edit
+    if DISCORD_WEBHOOK_URL and DISCORD_DASHBOARD_MSG_ID:
+        log("[6/6] Discord dashboard message edit...")
+        stats = _load_stats()
+        try:
+            update_discord_dashboard(stats)
+        except Exception as e:
+            log(f"  [ERR] Dashboard: {type(e).__name__}: {e}")
+            errors += 1
+    else:
+        log("[6/6] Discord dashboard... [SKIP] Missing webhook URL or message ID")
+
     log(f"\n=== DRY RUN COMPLETE — {errors} error(s) ===")
     if errors == 0:
         log("All systems operational. Ready for production.")

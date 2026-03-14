@@ -361,6 +361,8 @@ def _write_wg_conf() -> bool:
 def start_wireproxy() -> bool:
     """Start wireproxy SOCKS5 tunnel using Cloudflare WARP config."""
     global _wireproxy_active
+    if _wireproxy_active:
+        return True
     if not _write_wg_conf():
         log("  [INFO] WG_CONF_BASE64 not set, proxy fallback disabled")
         return False
@@ -382,25 +384,22 @@ def start_wireproxy() -> bool:
         log("  [WARN] wireproxy binary not found, proxy fallback disabled")
         return False
 
-    for i in range(15):
+    for _ in range(15):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             if s.connect_ex((PROXY_HOST, PROXY_PORT)) == 0:
                 try:
                     proxies = {"http": PROXY_URL, "https": PROXY_URL}
-                    ip = requests.get("https://api.ipify.org", proxies=proxies, timeout=10).text.strip()
+                    ip = requests.get("http://api.ipify.org", proxies=proxies, timeout=5).text.strip()
                     log(f"  [OK] Wireproxy active, IP: {ip}")
                 except Exception:
-                    log(f"  [OK] Wireproxy port open (IP check failed, but proxy is up)")
+                    log(f"  [OK] Wireproxy port open")
                 _wireproxy_active = True
                 return True
         time.sleep(1)
 
-    # Dump wireproxy output for debugging
     try:
         with open(os.path.join(OUTPUT_DIR, "wireproxy.log"), "r") as f:
-            wp_output = f.read().strip()
-        if wp_output:
-            for line in wp_output.split("\n")[:10]:
+            for line in f.read().strip().split("\n")[:10]:
                 log(f"  [WIREPROXY] {line}")
     except Exception:
         pass
@@ -446,9 +445,12 @@ def scrape_article_text(url: str) -> str:
                 return ""
             return _extract_html_text(res.text)
         except (requests.HTTPError, requests.Timeout, requests.ConnectionError):
-            pass  # Fall through to proxy attempt
+            pass
 
-        # Pass 2: retry through wireproxy (different IP)
+        # Start wireproxy on-demand on first blocked request
+        if not _wireproxy_active and WG_CONF_BASE64:
+            start_wireproxy()
+
         if _wireproxy_active:
             try:
                 proxies = {"http": PROXY_URL, "https": PROXY_URL}
@@ -575,8 +577,6 @@ def fetch_daily_news() -> str:
     log("[1/6] Downloading fresh articles...")
     cutoff = datetime.now(timezone.utc) - timedelta(hours=SCRAPE_HOURS_BACK)
     log(f"  [INFO] Articles since {cutoff.strftime('%Y-%m-%d %H:%M')} UTC ({SCRAPE_HOURS_BACK}h back)")
-
-    start_wireproxy()
 
     seen_urls = _load_seen_urls()
     log(f"  [INFO] {len(seen_urls)} previously seen article URLs loaded")
@@ -1869,23 +1869,21 @@ def run_dry_test():
     log(f"  [INFO] {ok_feeds}/{len(RSS_FEEDS)} feeds accessible")
 
     # 4. Test scraping a few articles (one per approach)
-    log("[4/5] Test scraping (one direct, one via proxy)...")
-    test_urls = [
-        ("https://www.denik.cz/", "direct"),
-        ("https://www.irozhlas.cz/", "proxy"),
-    ]
-    for url, method in test_urls:
+    log("[4/5] Test scraping...")
+    try:
+        headers = _random_headers("https://www.denik.cz/")
+        res = SESSION.get("https://www.denik.cz/", headers=headers, timeout=SCRAPE_TIMEOUT)
+        log(f"  [OK] www.denik.cz (direct): HTTP {res.status_code}")
+    except Exception as e:
+        log(f"  [ERR] www.denik.cz (direct): {type(e).__name__}: {e}")
+        errors += 1
+    if _wireproxy_active:
         try:
-            headers = _random_headers(url)
-            if method == "proxy" and _wireproxy_active:
-                proxies = {"http": PROXY_URL, "https": PROXY_URL}
-                res = SESSION.get(url, headers=headers, timeout=SCRAPE_TIMEOUT, proxies=proxies)
-            else:
-                res = SESSION.get(url, headers=headers, timeout=SCRAPE_TIMEOUT)
-            log(f"  [OK] {_get_domain(url)} ({method}): HTTP {res.status_code}")
+            proxies = {"http": PROXY_URL, "https": PROXY_URL}
+            res = SESSION.get("http://api.ipify.org", proxies=proxies, timeout=5)
+            log(f"  [OK] Proxy IP: {res.text.strip()}")
         except Exception as e:
-            log(f"  [ERR] {_get_domain(url)} ({method}): {type(e).__name__}: {e}")
-            errors += 1
+            log(f"  [WARN] Proxy IP check failed: {type(e).__name__} (non-critical)")
 
     # 5. Vyzyvatel API
     log("[5/5] Vyzyvatel API...")

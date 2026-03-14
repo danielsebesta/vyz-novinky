@@ -6,6 +6,11 @@ import re
 import os
 import time
 import hashlib
+import random
+import base64
+import socket
+import subprocess
+import threading
 from collections import Counter, OrderedDict
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,15 +20,16 @@ from typing import List, Literal, Optional
 from email.utils import parsedate_to_datetime
 from calendar import timegm
 
-# Configuration
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_API_KEY2 = os.environ.get("OPENAI_API_KEY2", "")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY environment variable is required")
 
 VYZYVATEL_API_KEY = os.environ.get("VYZYVATEL_API_KEY", "")
-VYZYVATEL_SET_ID = os.environ.get("VYZYVATEL_SET_ID", "5402")
+VYZYVATEL_SET_ID = os.environ.get("VYZYVATEL_SET_ID", "")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+DISCORD_DASHBOARD_MSG_ID = os.environ.get("DISCORD_DASHBOARD_MSG_ID", "")
+DRY_RUN = os.environ.get("DRY_RUN", "").lower() in ("1", "true", "yes")
 
 RSS_FEEDS = [
     "https://www.seznamzpravy.cz/rss",
@@ -49,13 +55,15 @@ RSS_FEEDS = [
     "https://www.lupa.cz/rss/aktuality/",
     "https://www.reflex.cz/rss",
     "https://sport.ceskatelevize.cz/rss",
+    "https://www.parlamentnilisty.cz/export/rss.aspx",
+    "https://www.blesk.cz/rss",
 ]
 
 SCRAPE_HOURS_BACK = 25
 MAX_ENTRIES_PER_FEED = 0
 MAX_ARTICLE_CHARS = 6000
 SCRAPE_WORKERS = 12
-SCRAPE_TIMEOUT = 8
+SCRAPE_TIMEOUT = 12
 CHUNK_CHARS = 60_000
 MINI_MODEL = "gpt-5-mini"
 PREMIUM_MODEL = "gpt-5.4"
@@ -68,11 +76,32 @@ API_RETRIES = 3
 CLEANUP_DAYS = 7
 PREMIUM_TOKEN_BUDGET = 200_000  # Stay safely under 250K free limit per key
 
+WG_CONF_BASE64 = os.environ.get("WG_CONF_BASE64", "")
+WG_CONF_FILE = "/tmp/wg.conf"
+PROXY_URL = "socks5://127.0.0.1:1080"
+PROXY_HOST = "127.0.0.1"
+PROXY_PORT = 1080
+_wireproxy_active = False
+
+# Domains where direct HTTP scraping never works (JS-only SPA)
+SKIP_SCRAPE_DOMAINS = {"www.seznamzpravy.cz"}
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.4; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
+]
+
 client1 = OpenAI(api_key=OPENAI_API_KEY, timeout=API_TIMEOUT)
 client2 = OpenAI(api_key=OPENAI_API_KEY2, timeout=API_TIMEOUT) if OPENAI_API_KEY2 else None
 
-# Track premium model token usage per client
 _token_usage = {"client1": 0, "client2": 0}
+_mini_token_usage = {"client1": 0, "client2": 0}
 
 
 def _get_client_and_name(prefer_secondary: bool = False) -> tuple:
@@ -83,9 +112,11 @@ def _get_client_and_name(prefer_secondary: bool = False) -> tuple:
         return client1, "client1"
     if client2 and _token_usage["client2"] < PREMIUM_TOKEN_BUDGET:
         return client2, "client2"
-    # Both exhausted — return client1 anyway (will likely hit billing)
-    log(f"  [WARN] Both API key budgets exhausted! client1: {_token_usage['client1']:,}, client2: {_token_usage['client2']:,}")
-    return client1, "client1"
+    # Both exhausted — hard stop to prevent billing
+    raise RuntimeError(
+        f"Both API key budgets exhausted! client1: {_token_usage['client1']:,}, "
+        f"client2: {_token_usage['client2']:,}. Stopping to prevent billing."
+    )
 
 
 def preflight_check():
@@ -122,7 +153,6 @@ def api_call_with_retry(func, *args, **kwargs):
             time.sleep(5 * attempt)
 
 
-# Pydantic schemas
 class Question(BaseModel):
     content: str = Field(description="Question text.")
     questionType: Literal["pick", "number"] = Field(description="Question type.")
@@ -134,7 +164,6 @@ class QuizResponse(BaseModel):
     questions: List[Question]
 
 
-# Helpers & Logging
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 DEBUG_LOG_FILE = os.path.join(OUTPUT_DIR, f"debug_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log")
 
@@ -147,7 +176,6 @@ def log(msg):
         f.write(line + "\n")
 
 
-# Paywall and clutter removal
 PAYWALL_PHRASES = [
     "Zajímají vás další kvalitní článk", "Chcete vědět, co se děje",
     "Odebírejte nejlepší newsletter", "Abyste mohli pokračovat",
@@ -155,6 +183,9 @@ PAYWALL_PHRASES = [
     "Registrujte se zdarma", "Tento obsah je dostupný pouze",
     "Získejte přístup k celému článku", "Vyzkoušejte Premium",
     "Už mám předplatné", "Přihlásit se přes", "Pokračujte ve čtení",
+    "Článek je jen pro předplatitele", "Zbytek článku je pouze pro",
+    "Odemknout článek", "Celý článek čtěte na", "Premium obsah",
+    "Tento článek je placený", "Kupte si digitální předplatné",
 ]
 
 _GARBAGE_PATTERNS = [
@@ -233,66 +264,225 @@ def is_recent(entry, cutoff: datetime) -> bool:
     return dt >= cutoff
 
 
-# Scraping
 SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "cs,en;q=0.5",
-})
 
-# Scrape error tracking for diagnostics — tracks per domain
 _scrape_errors: dict[str, Counter] = {}
+
+_domain_locks: dict[str, threading.Semaphore] = {}
+_domain_locks_lock = threading.Lock()
+
+
+def _get_domain(url: str) -> str:
+    """Extract domain from URL."""
+    try:
+        return url.split("/")[2]
+    except (IndexError, AttributeError):
+        return "unknown"
+
+
+def _get_domain_sem(url: str) -> threading.Semaphore:
+    """Get or create a per-domain semaphore (max 2 concurrent)."""
+    domain = _get_domain(url)
+    with _domain_locks_lock:
+        if domain not in _domain_locks:
+            _domain_locks[domain] = threading.Semaphore(2)
+    return _domain_locks[domain]
+
+
+def _random_headers(url: str) -> dict:
+    """Generate realistic browser headers with rotated User-Agent."""
+    domain = _get_domain(url)
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "cs-CZ,cs;q=0.9,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Referer": f"https://{domain}/",
+    }
 
 
 def _track_error(url: str, error_type: str):
     """Record a scrape error for the given URL's domain."""
-    try:
-        domain = url.split("/")[2]
-    except (IndexError, AttributeError):
-        domain = "unknown"
+    domain = _get_domain(url)
     if domain not in _scrape_errors:
         _scrape_errors[domain] = Counter()
     _scrape_errors[domain][error_type] += 1
 
 
-def scrape_article_text(url: str) -> str:
-    """Download and extract raw text from an article URL."""
+def _write_wg_conf() -> bool:
+    """Decode WG_CONF_BASE64 env var and write to temp file."""
+    if not WG_CONF_BASE64:
+        return False
     try:
-        res = SESSION.get(url, timeout=SCRAPE_TIMEOUT, allow_redirects=True)
-        res.raise_for_status()
-        if "text/html" not in res.headers.get("Content-Type", ""):
-            _track_error(url, "non_html")
-            return ""
-        soup = BeautifulSoup(res.text, "html.parser")
-        for tag in soup.find_all(["script", "style", "nav", "footer", "aside", "header", "form", "iframe"]):
-            tag.decompose()
-        paragraphs = (soup.find("article") or soup).find_all("p")
-        texts = [p.get_text().strip() for p in paragraphs]
-        text = " ".join(t for t in texts if len(t) > 20)
-        return text[:MAX_ARTICLE_CHARS] if MAX_ARTICLE_CHARS else text
-    except requests.Timeout:
-        _track_error(url, "timeout")
+        with open(WG_CONF_FILE, "w") as f:
+            f.write(base64.b64decode(WG_CONF_BASE64).decode())
+        return True
+    except Exception as e:
+        log(f"  [WARN] Failed to write wg.conf: {e}")
+        return False
+
+
+def start_wireproxy() -> bool:
+    """Start wireproxy SOCKS5 tunnel using Cloudflare WARP config."""
+    global _wireproxy_active
+    if not _write_wg_conf():
+        log("  [INFO] WG_CONF_BASE64 not set, proxy fallback disabled")
+        return False
+
+    log("  [INFO] Starting wireproxy tunnel...")
+    subprocess.run(["pkill", "wireproxy"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(1)
+    subprocess.Popen(
+        ["wireproxy", "-c", WG_CONF_FILE],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+    for _ in range(15):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex((PROXY_HOST, PROXY_PORT)) == 0:
+                try:
+                    proxies = {"http": PROXY_URL, "https": PROXY_URL}
+                    ip = requests.get("https://api.ipify.org", proxies=proxies, timeout=10).text.strip()
+                    log(f"  [OK] Wireproxy active, IP: {ip}")
+                except Exception:
+                    log(f"  [OK] Wireproxy port open (IP check failed, but proxy is up)")
+                _wireproxy_active = True
+                return True
+        time.sleep(1)
+
+    log("  [WARN] Wireproxy failed to start within 15s")
+    return False
+
+
+def _extract_html_text(html: str) -> str:
+    """Extract article text from HTML content."""
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup.find_all(["script", "style", "nav", "footer", "aside", "header", "form", "iframe"]):
+        tag.decompose()
+    paragraphs = (soup.find("article") or soup).find_all("p")
+    texts = [p.get_text().strip() for p in paragraphs]
+    text = " ".join(t for t in texts if len(t) > 20)
+    return text[:MAX_ARTICLE_CHARS] if MAX_ARTICLE_CHARS else text
+
+
+def scrape_article_text(url: str) -> str:
+    """Download and extract raw text from an article URL with proxy fallback."""
+    domain = _get_domain(url)
+
+    # Skip domains that are known JS-only SPAs
+    if domain in SKIP_SCRAPE_DOMAINS:
         return ""
-    except requests.HTTPError as e:
-        _track_error(url, f"http_{e.response.status_code}")
-        return ""
-    except requests.ConnectionError:
-        _track_error(url, "connection")
+
+    headers = _random_headers(url)
+    sem = _get_domain_sem(url)
+
+    # Add jitter between requests to same domain
+    time.sleep(random.uniform(0.3, 1.0))
+
+    sem.acquire()
+    try:
+        # Pass 1: direct request
+        try:
+            res = SESSION.get(url, headers=headers, timeout=SCRAPE_TIMEOUT, allow_redirects=True)
+            if res.status_code in (403, 429):
+                raise requests.HTTPError(response=res)
+            res.raise_for_status()
+            if "text/html" not in res.headers.get("Content-Type", ""):
+                _track_error(url, "non_html")
+                return ""
+            return _extract_html_text(res.text)
+        except (requests.HTTPError, requests.Timeout, requests.ConnectionError):
+            pass  # Fall through to proxy attempt
+
+        # Pass 2: retry through wireproxy (different IP)
+        if _wireproxy_active:
+            try:
+                proxies = {"http": PROXY_URL, "https": PROXY_URL}
+                res = SESSION.get(url, headers=headers, timeout=SCRAPE_TIMEOUT,
+                                  allow_redirects=True, proxies=proxies)
+                res.raise_for_status()
+                if "text/html" not in res.headers.get("Content-Type", ""):
+                    _track_error(url, "non_html")
+                    return ""
+                return _extract_html_text(res.text)
+            except requests.Timeout:
+                _track_error(url, "timeout_proxy")
+                return ""
+            except requests.HTTPError as e:
+                _track_error(url, f"http_{e.response.status_code}_proxy")
+                return ""
+            except requests.ConnectionError:
+                _track_error(url, "connection_proxy")
+                return ""
+            except Exception as e:
+                _track_error(url, f"{type(e).__name__}_proxy")
+                return ""
+
+        # No proxy available, track the original error
+        _track_error(url, "blocked_no_proxy")
         return ""
     except Exception as e:
         _track_error(url, type(e).__name__)
         return ""
+    finally:
+        sem.release()
+
+
+def _get_rss_content(entry) -> str:
+    """Extract the best available content from RSS entry fields."""
+    # 1. Try content:encoded (full article HTML — e.g., CNN Prima)
+    content_list = entry.get("content", [])
+    if content_list:
+        for c in content_list:
+            value = c.get("value", "")
+            if len(value) > 200:
+                soup = BeautifulSoup(value, "html.parser")
+                return soup.get_text(separator=" ", strip=True)
+
+    # 2. Try summary/description (most feeds have this)
+    summary = entry.get("summary", "") or entry.get("description", "")
+    if summary:
+        # Strip HTML tags if present
+        if "<" in summary:
+            soup = BeautifulSoup(summary, "html.parser")
+            summary = soup.get_text(separator=" ", strip=True)
+        return summary.strip()
+
+    return ""
 
 
 def scrape_single_entry(entry) -> dict | None:
-    """Process a single RSS entry into structured content."""
-    content = clean_garbage(scrape_article_text(entry.get("link", "")))
-    if len(content) < 200:
-        content = clean_garbage(entry.get("summary", ""))
-    if len(content) < 100:
-        return None
-    return {"title": entry.get("title", ""), "content": content}
+    """Process a single RSS entry into structured content.
+
+    Order: RSS content → HTTP scrape → RSS summary fallback.
+    """
+    url = entry.get("link", "")
+    domain = _get_domain(url)
+
+    # 1. Try RSS content first (free, instant, no HTTP needed)
+    rss_content = clean_garbage(_get_rss_content(entry))
+
+    # 2. If RSS content is rich enough (>200 chars), use it directly
+    if len(rss_content) >= 200:
+        return {"title": entry.get("title", ""), "content": rss_content[:MAX_ARTICLE_CHARS]}
+
+    # 3. Otherwise, try scraping the article URL
+    scraped = clean_garbage(scrape_article_text(url))
+    if len(scraped) >= 200:
+        return {"title": entry.get("title", ""), "content": scraped}
+
+    # 4. Fall back to whatever RSS content we have (even if short)
+    if len(rss_content) >= 80:
+        return {"title": entry.get("title", ""), "content": rss_content}
+
+    return None
 
 
 def fetch_daily_news() -> str:
@@ -301,11 +491,15 @@ def fetch_daily_news() -> str:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=SCRAPE_HOURS_BACK)
     log(f"  [INFO] Articles since {cutoff.strftime('%Y-%m-%d %H:%M')} UTC ({SCRAPE_HOURS_BACK}h back)")
 
+    # Start wireproxy for fallback scraping
+    start_wireproxy()
+
     entries_to_scrape = []
     for url in RSS_FEEDS:
         source = url.split("/")[2]
         try:
-            res = SESSION.get(url, timeout=SCRAPE_TIMEOUT)
+            headers = _random_headers(url)
+            res = SESSION.get(url, headers=headers, timeout=SCRAPE_TIMEOUT)
             feed = feedparser.parse(res.content)
             recent = [e for e in feed.entries if is_recent(e, cutoff)]
             if MAX_ENTRIES_PER_FEED:
@@ -439,6 +633,8 @@ def extract_facts(raw_text: str) -> str:
             max_completion_tokens=16_000,
         )
         content = resp.choices[0].message.content
+        if resp.usage:
+            _mini_token_usage["client1"] += resp.usage.total_tokens
         log(f"  [OK] Chunk {idx}/{len(chunks)} completed.")
         return content
 
@@ -457,7 +653,7 @@ def extract_facts(raw_text: str) -> str:
     return merged
 
 
-# ================= STEP 3: CATEGORIZE & PRIORITIZE =================
+
 CATEGORIZE_SYSTEM_PROMPT = """\
 You are a news editor preparing material for a pub quiz. Your task is to take a raw list of facts and produce a STRUCTURED, CATEGORIZED, DEDUPLICATED summary.
 
@@ -567,92 +763,273 @@ def _merge_categorized_chunks(chunk_results: list[str]) -> str:
     return merged
 
 
-def categorize_facts(raw_facts: str) -> str:
-    """Categorize, deduplicate and prioritize extracted facts via gpt-5-mini."""
-    log("[3/6] Categorizing & Prioritizing Facts...")
-    
-    # Split into chunks if facts are very long
-    chunks: list[str] = []
-    lines = raw_facts.split("\n")
-    current_chunk: list[str] = []
-    current_len = 0
-    
-    for line in lines:
-        line_len = len(line)
-        if current_len + line_len > CHUNK_CHARS and current_chunk:
-            chunks.append("\n".join(current_chunk))
-            current_chunk = []
-            current_len = 0
-        current_chunk.append(line)
-        current_len += line_len
-    if current_chunk:
-        chunks.append("\n".join(current_chunk))
-    
-    log(f"  [INFO] {len(chunks)} chunk(s), categorizing in parallel...")
-    
-    def categorize_chunk(idx, chunk):
+CATEGORY_KEYWORDS = {
+    "SPORT": {
+        "fotbal", "hokej", "tenis", "liga", "zápas", "gól", "trenér", "hráč", "hráčka",
+        "olymp", "fifa", "uefa", "extraliga", "bundesliga", "premier", "champions",
+        "mistrovství", "medaile", "semifinále", "finále", "čtvrtfinále", "turnaj",
+        "skóre", "výhra", "prohra", "remíza", "branky", "brankář", "střelec",
+        "atletika", "plavání", "lyžování", "biatlon", "formule", "moto", "cyklisti",
+        "basketbal", "volejbal", "handball", "florbal", "baseball", "golf",
+        "sparťan", "slávista", "plzeň", "baník", "sparta", "slavia", "bohemians",
+        "nhl", "nba", "f1", "wta", "atp", "ufc", "boxing", "mma",
+        "reprezentace", "národní tým", "přestup", "draft", "playoff",
+        "stadion", "olympiáda", "paralymp", "sport", "sportov",
+    },
+    "POLITIKA": {
+        "vláda", "ministr", "ministerstvo", "parlament", "zákon", "prezident",
+        "volby", "strana", "poslanec", "senát", "sněmovna", "koalice", "opozice",
+        "premiér", "kancléř", "politický", "politika", "mandát", "hlasování",
+        "referendum", "novela", "ústavní", "legislativ", "vyhlášk",
+        "babiš", "fiala", "pavel", "zeman", "ano", "spd", "motorist",
+        "piráti", "stan", "ods", "top09", "čssd", "ksčm",
+        "zastupitel", "starosta", "hejtman", "radnice", "radní",
+    },
+    "EKONOMIKA": {
+        "miliard", "milion", "inflace", "hdp", "banka", "akcie", "burza",
+        "kurz", "firma", "export", "import", "daň", "rozpočet", "cena",
+        "ekonomika", "ekonomický", "tržby", "zisk", "ztráta", "dluh",
+        "úrok", "hypotéka", "investice", "investor", "startup",
+        "čnb", "ecb", "fed", "koruna", "euro", "dolar",
+        "nezaměstnanost", "mzda", "plat", "důchod", "obchod",
+        "energi", "plyn", "ropa", "benzín", "nafta", "elektřin",
+        "nemovitost", "bydlení", "nájem", "reality",
+    },
+    "TECHNOLOGIE": {
+        "ai", "umělá inteligence", "aplikace", "software", "hardware",
+        "google", "apple", "microsoft", "meta", "amazon", "tesla", "nvidia",
+        "startup", "digitální", "kyber", "robot", "procesor", "čip",
+        "internet", "online", "web", "cloud", "blockchain", "krypto",
+        "bitcoin", "openai", "chatgpt", "smartphone", "iphone", "android",
+        "technolog", "inovace", "patent", "vývoj", "programátor",
+        "sociální síť", "facebook", "instagram", "tiktok", "twitter",
+        "5g", "satelit", "spacex", "raketa", "databáz", "algorit",
+    },
+    "KULTURA A MÉDIA": {
+        "film", "herec", "herečka", "režisér", "koncert", "festival",
+        "kniha", "muzeum", "výstava", "galerie", "divadlo", "opera",
+        "seriál", "album", "kapela", "zpěvák", "zpěvačka", "hudba",
+        "oscar", "český lev", "grammy", "cena", "nominace",
+        "netflix", "hbo", "disney", "kino", "premiéra", "předpremiér",
+        "fotograf", "malíř", "sochař", "umělec", "umění",
+        "bestseller", "spisovatel", "nakladatel", "vydavatel",
+        "komiks", "anime", "podcast", "youtuber", "influencer",
+        "televizní", "televize", "rozhlas", "rádio", "média",
+    },
+    "VĚDA A ZDRAVÍ": {
+        "studie", "vědci", "výzkum", "nasa", "esa", "rakovina",
+        "léčba", "lék", "vakcína", "klima", "vesmír", "dinosaur",
+        "experiment", "objev", "patent", "laborato", "univerzit",
+        "nemocnice", "pacient", "lékař", "operace", "transplant",
+        "epidemi", "pandemi", "virus", "baktéri", "antibiot",
+        "psycholog", "psychiatr", "deprese", "zdraví", "zdravotn",
+        "fosíli", "archeolog", "evoluce", "genom", "dna", "gen",
+        "klimatick", "emise", "uhlík", "teplota", "počasí",
+        "asteroid", "planeta", "hvězda", "galaxie", "teleskop",
+    },
+    "SPOLEČNOST A KRIMINALITA": {
+        "policie", "policist", "nehoda", "soud", "trest", "vězení",
+        "požár", "záchrana", "hasič", "migrace", "uprchlík", "protest",
+        "kriminalit", "vražda", "krádež", "loupež", "podvod", "korupce",
+        "obžalovan", "odsouzen", "zatčen", "obviněn", "vyšetřován",
+        "nehoda", "havárie", "výbuch", "exploze", "záplava", "povodeň",
+        "demonstrace", "stávka", "žhářství", "vandalismus",
+        "drog", "dealer", "pašování", "organizovan", "mafie",
+        "záchranář", "ambulance", "zranění", "oběť", "přepadení",
+        "smrtelná", "tragédie", "katastrofa", "evakuace",
+    },
+    "SVĚT": {
+        "usa", "rusko", "ukrajina", "nato", "eu", "čína", "válka",
+        "summit", "ambasád", "diplomat", "trump", "putin", "zelenskyj",
+        "írán", "izrael", "palestin", "gaza", "hamás", "hizballáh",
+        "afghánistán", "severní korea", "pchjongjang", "kimčongun",
+        "pentagon", "kreml", "bílý dům", "kongres", "senát",
+        "sankce", "embargo", "příměří", "mírová", "jednání",
+        "unie", "aliance", "pakt", "smlouva", "rezoluce", "osn",
+        "uprchlíci", "humanitární", "pomoc", "krize",
+        "biden", "macron", "scholz", "merkel", "orbán",
+        "blízký východ", "asie", "afrika", "latinská amerika",
+    },
+}
+
+
+def _categorize_by_keywords(facts: list[str]) -> tuple[dict[str, list[str]], list[str]]:
+    """Assign facts to categories using keyword matching.
+
+    Returns (categorized dict, unmatched list).
+    """
+    categorized: dict[str, list[str]] = {cat: [] for cat in CATEGORY_KEYWORDS}
+    unmatched: list[str] = []
+
+    for fact in facts:
+        fact_lower = fact.lower()
+        best_cat = None
+        best_score = 0
+
+        for cat, keywords in CATEGORY_KEYWORDS.items():
+            score = sum(1 for kw in keywords if kw in fact_lower)
+            if score > best_score:
+                best_score = score
+                best_cat = cat
+
+        if best_cat and best_score > 0:
+            categorized[best_cat].append(fact)
+        else:
+            unmatched.append(fact)
+
+    return categorized, unmatched
+
+
+def _categorize_unmatched_llm(unmatched: list[str]) -> dict[str, list[str]]:
+    """Send unmatched facts to gpt-5-mini for categorization (single API call)."""
+    if not unmatched:
+        return {}
+
+    categories_list = ", ".join(CATEGORY_KEYWORDS.keys())
+    prompt = (
+        f"Assign each fact to exactly one of these categories: {categories_list}\n\n"
+        f"Output format — use ## headers and - bullets:\n"
+        f"## CATEGORY NAME\n- fact\n- fact\n\n"
+        f"Facts to categorize:\n" + "\n".join(f"- {f}" for f in unmatched)
+    )
+
+    try:
         resp = api_call_with_retry(
             client1.chat.completions.create,
             model=MINI_MODEL,
             messages=[
-                {"role": "system", "content": CATEGORIZE_SYSTEM_PROMPT},
-                {"role": "user", "content": f"Categorize and prioritize ALL these facts:\n\n{chunk}"},
+                {"role": "system", "content": "You are a news categorizer. Assign each fact to exactly one category. Output in Markdown with ## headers and - bullets. CZECH language."},
+                {"role": "user", "content": prompt},
             ],
-            max_completion_tokens=32_000,
+            max_completion_tokens=16_000,
         )
-        content = resp.choices[0].message.content
-        finish = resp.choices[0].finish_reason
-        
-        if not content:
-            log(f"  [WARN] Chunk {idx}/{len(chunks)}: empty response (finish_reason={finish})")
-            return ""
-        
-        # Strip markdown code fences that LLM sometimes wraps output in
+        content = resp.choices[0].message.content or ""
+        if resp.usage:
+            _mini_token_usage["client1"] += resp.usage.total_tokens
+
+        # Strip markdown code fences
         content = re.sub(r"^```(?:markdown|md)?\s*\n?", "", content)
         content = re.sub(r"\n?```\s*$", "", content)
-        
-        log(f"  [OK] Chunk {idx}/{len(chunks)}: {len(content):,} chars (finish_reason={finish})")
-        return content
 
-    chunk_results: list[str] = ["" for _ in chunks]
-    with ThreadPoolExecutor(max_workers=min(10, len(chunks))) as pool:
-        futures = {pool.submit(categorize_chunk, idx, chunk): idx for idx, chunk in enumerate(chunks, 1)}
-        for future in as_completed(futures):
-            idx = futures[future]
-            try:
-                chunk_results[idx - 1] = future.result()
-            except Exception as e:
-                log(f"  [ERR] Categorize chunk {idx} error: {e}")
+        # Parse the response into categories
+        result: dict[str, list[str]] = {}
+        current_cat = None
+        for line in content.split("\n"):
+            line = line.strip()
+            if line.startswith("## "):
+                current_cat = line[3:].strip().upper()
+            elif line.startswith("- ") and current_cat:
+                if current_cat not in result:
+                    result[current_cat] = []
+                result[current_cat].append(line[2:].strip())
 
-    # Merge in Python — no LLM, no data loss
-    non_empty = [c for c in chunk_results if c]
-    
-    if not non_empty:
-        log(f"  [WARN] All categorization chunks returned empty! Using raw facts.")
+        log(f"  [OK] LLM categorized {len(unmatched)} unmatched facts into {len(result)} categories")
+        return result
+    except Exception as e:
+        log(f"  [WARN] LLM categorization of unmatched facts failed: {e}")
+        return {"SVĚT": unmatched}  # Fallback: dump into SVĚT
+
+
+def _dedup_category_facts(facts: list[str], threshold: float = 0.55) -> list[str]:
+    """Deduplicate facts within a category using Jaccard similarity."""
+    if not facts:
+        return facts
+
+    kept: list[tuple[set[str], str]] = []
+    stop = {"kdo", "kde", "kdy", "jak", "jaký", "jaká", "jaké", "který", "která",
+            "které", "kolik", "byl", "byla", "bylo", "pro", "při", "pod",
+            "nad", "mezi", "nebo", "ale", "tak", "již", "jen", "ještě"}
+
+    for fact in facts:
+        words = {w for w in re.sub(r"[^\w\s]", "", fact.lower()).split()
+                 if len(w) > 2 and w not in stop}
+        if not words:
+            kept.append((set(), fact))
+            continue
+
+        is_dup = False
+        for existing_words, _ in kept:
+            if existing_words:
+                overlap = len(words & existing_words) / len(words | existing_words)
+                if overlap >= threshold:
+                    is_dup = True
+                    break
+        if not is_dup:
+            kept.append((words, fact))
+
+    return [fact for _, fact in kept]
+
+
+def categorize_facts(raw_facts: str) -> str:
+    """Hybrid categorization: Python keywords first, gpt-5-mini for unmatched."""
+    log("[3/6] Categorizing & Prioritizing Facts (hybrid)...")
+
+    # Parse bullet facts from extraction output
+    facts = []
+    for line in raw_facts.split("\n"):
+        line = line.strip()
+        if line.startswith("- "):
+            facts.append(line[2:].strip())
+
+    if not facts:
+        log("  [WARN] No bullet facts found in input, using raw text.")
         return raw_facts
-    
-    # Debug: log first 200 chars of each chunk so we can see the format
-    for i, c in enumerate(non_empty):
-        preview = c[:200].replace("\n", " | ")
-        log(f"  [DEBUG] Chunk {i+1}/{len(non_empty)} preview: {preview}...")
-    
-    result = _merge_categorized_chunks(non_empty)
 
-    # Count categories and facts
-    categories_found = [l for l in result.split("\n") if l.strip().startswith("## ")]
-    fact_lines = [l for l in result.split("\n") if l.strip().startswith("- ")]
-    log(f"  [OK] {len(fact_lines)} facts in {len(categories_found)} categories ({len(result):,} chars)")
-    
+    log(f"  [INFO] {len(facts)} facts to categorize...")
+
+    # Pass 1: Python keyword matching (instant)
+    categorized, unmatched = _categorize_by_keywords(facts)
+    matched_count = sum(len(v) for v in categorized.values())
+    log(f"  [OK] Keywords matched {matched_count}/{len(facts)} facts, {len(unmatched)} unmatched")
+
+    # Pass 2: gpt-5-mini for unmatched (one small API call)
+    if unmatched:
+        log(f"  [INFO] Sending {len(unmatched)} unmatched facts to {MINI_MODEL}...")
+        llm_categorized = _categorize_unmatched_llm(unmatched)
+
+        # Merge LLM results into main categories
+        for cat, cat_facts in llm_categorized.items():
+            # Map LLM category names to our standard names
+            matched_key = None
+            for key in categorized:
+                if key in cat or cat in key:
+                    matched_key = key
+                    break
+            if matched_key:
+                categorized[matched_key].extend(cat_facts)
+            else:
+                # Unknown category from LLM — dump into SVĚT
+                categorized["SVĚT"].extend(cat_facts)
+
+    # Deduplicate within each category
+    for cat in categorized:
+        categorized[cat] = _dedup_category_facts(categorized[cat])
+
+    # Build output in same format as before
+    output_lines = []
+    total_facts = 0
+    category_count = 0
+    for cat in CATEGORY_KEYWORDS:
+        cat_facts = categorized.get(cat, [])
+        if cat_facts:
+            output_lines.append(f"## {cat}")
+            for fact in cat_facts:
+                output_lines.append(f"- {fact}")
+            output_lines.append("")
+            total_facts += len(cat_facts)
+            category_count += 1
+
+    log(f"  [OK] {total_facts} facts in {category_count} categories")
+
     # Sanity check: if we lost too much data, fall back to raw facts
-    raw_bullet_count = raw_facts.count("\n- ")
-    if len(fact_lines) < 50 or (raw_bullet_count > 0 and len(fact_lines) < raw_bullet_count * 0.15):
-        log(f"  [WARN] Only {len(fact_lines)} facts survived (raw had ~{raw_bullet_count} bullets) — too few, using raw facts")
+    if total_facts < 50:
+        log(f"  [WARN] Only {total_facts} facts survived — too few, using raw facts")
         return raw_facts
-    
-    return result
+
+    return "\n".join(output_lines)
 
 
-# ================= STEP 4: QUESTION GENERATION =================
+
 def _build_quiz_prompt():
     now = datetime.now()
     return f"""\
@@ -768,13 +1145,17 @@ STYLE & LANGUAGE:
 - ALL EXPORTED QUESTIONS AND ANSWERS MUST BE STRICTLY IN CZECH LANGUAGE.
 - Concise, human, with humor where appropriate.
 - No parentheses, no references to "article" or "text".
+- MAXIMUM 150 CHARACTERS per question. If longer, rephrase to be shorter.
+- ABSOLUTELY BANNED PHRASES in questions: "podle titulku", "podle textu", "dle textu", "podle článku", "v textu", "v článku", "titulkem". Questions must be SELF-CONTAINED — the reader has NO article. Write as if asking a pub quiz question to someone who reads news.
 
 FINAL CHECK (perform before submitting!):
 1. Is the answer enclosed right in the text of the question? -> YES means delete it.
 2. Could an average person guess it without reading news? -> YES means delete it.
 3. Does the question realistically have only 2 possible answers? -> YES means rephrase it.
 4. Do I have questions from at least 6 different categories? -> NO means replace duplicates from overrepresented categories.
-5. Can the reader tell the domain/sport/country/field from the question alone? -> NO means add the missing context."""
+5. Can the reader tell the domain/sport/country/field from the question alone? -> NO means add the missing context.
+6. Does the question contain "podle", "dle", "v textu", "v článku"? -> YES means rewrite it as a standalone question.
+7. Is the question longer than 150 characters? -> YES means shorten it."""
 
 
 def _question_words(text: str) -> set[str]:
@@ -798,10 +1179,26 @@ def _validate_questions(questions: list[dict]) -> list[dict]:
         re.IGNORECASE
     )
 
+    # Banned phrases that reference source text
+    article_ref_pattern = re.compile(
+        r"podle (titulku|textu|článku)|dle (textu|článku)|v textu|v článku|titulkem",
+        re.IGNORECASE
+    )
+
     for q in questions:
-        # 0) NSFW check
+        # 0a) NSFW check
         if nsfw_pattern.search(q["content"]):
             log(f"  [WARN] Blocked (NSFW filter): {q['content'][:60]}...")
+            continue
+
+        # 0b) Article reference check
+        if article_ref_pattern.search(q["content"]):
+            log(f"  [WARN] Blocked (article ref): {q['content'][:60]}...")
+            continue
+
+        # 0c) Length check (max 150 chars)
+        if len(q["content"]) > 150:
+            log(f"  [WARN] Blocked (too long, {len(q['content'])} chars): {q['content'][:60]}...")
             continue
 
         # 1) Exact textual duplication
@@ -929,23 +1326,40 @@ def generate_questions(summary: str) -> list[dict]:
     final_pick = [q for q in validated if q["questionType"] == "pick"]
     final_num = [q for q in validated if q["questionType"] == "number"]
 
-    for backfill in range(1, 7):
+    MAX_BACKFILL = 3
+    for backfill in range(1, MAX_BACKFILL + 1):
         need_p = NUM_PICK - len(final_pick)
         need_n = NUM_NUMBER - len(final_num)
         if need_p <= 0 and need_n <= 0:
             break
 
+        # Budget guard — stop backfilling if we're running low
+        remaining = max(
+            PREMIUM_TOKEN_BUDGET - _token_usage["client1"],
+            (PREMIUM_TOKEN_BUDGET - _token_usage["client2"]) if client2 else 0
+        )
+        if remaining < 30_000:
+            log(f"  [INFO] Budget too low for backfill ({remaining:,} tokens remaining). Stopping.")
+            break
+
         # Pick best available client
-        active_client, client_name = _get_client_and_name(prefer_secondary=True)
-        
+        try:
+            active_client, client_name = _get_client_and_name(prefer_secondary=True)
+        except RuntimeError:
+            log(f"  [WARN] Both budgets exhausted, stopping backfill.")
+            break
+
         parts = []
         if need_p > 0:
             parts.append(f"{need_p} pick")
         if need_n > 0:
             parts.append(f"{need_n} number")
-        log(f"  [INFO] Backfill {backfill}/6: missing {' + '.join(parts)}, using {client_name}...")
+        log(f"  [INFO] Backfill {backfill}/{MAX_BACKFILL}: missing {' + '.join(parts)}, using {client_name}...")
 
-        existing_topics = ', '.join(q['content'][:50] for q in final_pick + final_num)
+        # Send short topic keywords instead of full question text to save tokens
+        existing_topics = ', '.join(
+            ' '.join(q['content'].split()[:6]) for q in final_pick + final_num
+        )
         backfill_prompt = (
             f"I still need EXACTLY {' and '.join(parts)} questions. "
             f"Generate ONLY these, on DIFFERENT topics than what I already have: "
@@ -985,6 +1399,9 @@ def generate_questions(summary: str) -> list[dict]:
             final_pick.extend(q for q in new_valid if q["questionType"] == "pick")
             final_num.extend(q for q in new_valid if q["questionType"] == "number")
             log(f"  [INFO] Backfill: +{len(new_valid)} -> {len(final_pick)}pick {len(final_num)}number")
+        except RuntimeError as e:
+            log(f"  [WARN] Budget exhausted during backfill: {e}")
+            break
         except Exception as e:
             log(f"  [ERR] Backfill error: {e}")
 
@@ -995,7 +1412,7 @@ def generate_questions(summary: str) -> list[dict]:
 
     if len(final_pick) < NUM_PICK or len(final_num) < NUM_NUMBER:
         log(f"  [WARN] TARGET NOT MET! Wanted {NUM_PICK}+{NUM_NUMBER}={NUM_PICK+NUM_NUMBER}, "
-            f"got {len(final_pick)}+{len(final_num)}={len(final)} after 6 backfill attempts")
+            f"got {len(final_pick)}+{len(final_num)}={len(final)} after {MAX_BACKFILL} backfill attempts")
     else:
         log(f"  [OK] Target met: {len(final_pick)} pick + {len(final_num)} number = {len(final)} questions")
 
@@ -1019,7 +1436,7 @@ def upload_to_vyzyvatel(questions: list[dict]) -> None:
     payload_questions = []
     for q in questions:
         pq = {
-            "content": q["content"][:200],
+            "content": q["content"][:150],
             "questionType": q["questionType"],
             "correctAnswer": str(q["correctAnswer"])[:22] if q["questionType"] == "number" else str(q["correctAnswer"])[:100]
         }
@@ -1105,7 +1522,7 @@ def cleanup_old_questions(days_old: int = CLEANUP_DAYS) -> None:
         log(f"  [ERR] Fatal cleanup error: {type(e).__name__}: {e}")
 
 
-# ================= DISCORD WEBHOOK =================
+
 def send_discord_report(timings: dict, questions: list[dict], error_count: int, scrape_errors: dict, fact_count: int, category_count: int):
     """Send a pipeline summary embed to Discord webhook."""
     if not DISCORD_WEBHOOK_URL:
@@ -1133,7 +1550,7 @@ def send_discord_report(timings: dict, questions: list[dict], error_count: int, 
         scrape_lines.append(f"`{domain}`: {dict(errors)}")
     scrape_text = "\n".join(scrape_lines[:5]) if scrape_lines else "None"
     
-    # Token usage
+    # Token usage (premium)
     token_lines = []
     for name, used in _token_usage.items():
         if name == "client2" and not client2:
@@ -1142,6 +1559,13 @@ def send_discord_report(timings: dict, questions: list[dict], error_count: int, 
         bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
         token_lines.append(f"`{name}`: {used:,} / {PREMIUM_TOKEN_BUDGET:,} ({pct}%) {bar}")
     token_text = "\n".join(token_lines) if token_lines else "N/A"
+
+    # Token usage (mini)
+    mini_budget = 2_500_000
+    mini_total = sum(_mini_token_usage.values())
+    mini_pct = round(mini_total / mini_budget * 100) if mini_budget else 0
+    mini_bar = "█" * (mini_pct // 10) + "░" * (10 - mini_pct // 10)
+    mini_text = f"`total`: {mini_total:,} / {mini_budget:,} ({mini_pct}%) {mini_bar}"
     
     embed = {
         "title": f"📰 Daily Quiz — {today}",
@@ -1179,8 +1603,13 @@ def send_discord_report(timings: dict, questions: list[dict], error_count: int, 
                 "inline": True,
             },
             {
-                "name": "🔑 Token Usage (gpt-5.4)",
+                "name": "🔑 Premium Tokens (gpt-5.4)",
                 "value": token_text,
+                "inline": False,
+            },
+            {
+                "name": "🔑 Mini Tokens (gpt-5-mini)",
+                "value": mini_text,
                 "inline": False,
             },
         ],
@@ -1207,8 +1636,185 @@ def send_discord_report(timings: dict, questions: list[dict], error_count: int, 
             log(f"  [ERR] Discord webhook: {resp.status_code} - {resp.text[:100]}")
     except Exception as e:
         log(f"  [ERR] Discord webhook error: {type(e).__name__}: {e}")
-SCHEDULE_HOUR = 11      # Pipeline starts at 11:45 Prague time
-SCHEDULE_MINUTE = 10
+
+
+def update_discord_dashboard(stats: dict):
+    """Update a persistent Discord message with a stats dashboard (last 7 runs)."""
+    if not DISCORD_WEBHOOK_URL or not DISCORD_DASHBOARD_MSG_ID:
+        return
+
+    runs = stats.get("runs", [])[-7:]
+    if not runs:
+        return
+
+    # Build runs table
+    lines = []
+    for run in reversed(runs):
+        date = run.get("date", "?")
+        q_total = run.get("questions", 0)
+        status = "✅" if q_total >= 40 else "⚠️" if q_total >= 35 else "❌"
+        total_time = run.get("total", 0)
+        t1 = run.get("tokens_client1", 0)
+        t2 = run.get("tokens_client2", 0)
+        lines.append(
+            f"{status} **{date}** | {q_total}/40 | "
+            f"{total_time:.0f}s | "
+            f"t1:{t1:,} t2:{t2:,}"
+        )
+
+    # Average stats
+    avg_questions = sum(r.get("questions", 0) for r in runs) / len(runs)
+    avg_time = sum(r.get("total", 0) for r in runs) / len(runs)
+    success_rate = sum(1 for r in runs if r.get("questions", 0) >= 40) / len(runs) * 100
+
+    embed = {
+        "title": "📊 Quiz Pipeline Dashboard",
+        "color": 0x3498DB,
+        "description": (
+            f"**Last {len(runs)} runs** | "
+            f"Avg: {avg_questions:.0f}/40 questions | "
+            f"Avg time: {avg_time:.0f}s ({avg_time/60:.1f}min) | "
+            f"Success: {success_rate:.0f}%"
+        ),
+        "fields": [
+            {
+                "name": "Recent Runs",
+                "value": "\n".join(lines) if lines else "No data",
+                "inline": False,
+            },
+            {
+                "name": "Config",
+                "value": (
+                    f"Feeds: {len(RSS_FEEDS)} | "
+                    f"Schedule: {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d} → {PUBLISH_HOUR:02d}:{PUBLISH_MINUTE:02d} | "
+                    f"Budget: {PREMIUM_TOKEN_BUDGET:,}/key | "
+                    f"Proxy: {'✅' if _wireproxy_active else '❌'}"
+                ),
+                "inline": False,
+            },
+        ],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "footer": {"text": "Auto-updated after each pipeline run"},
+    }
+
+    # Extract webhook ID and token from webhook URL to edit the message
+    # Webhook URL format: https://discord.com/api/webhooks/{id}/{token}
+    try:
+        parts = DISCORD_WEBHOOK_URL.rstrip("/").split("/")
+        webhook_id = parts[-2]
+        webhook_token = parts[-1]
+        edit_url = f"https://discord.com/api/webhooks/{webhook_id}/{webhook_token}/messages/{DISCORD_DASHBOARD_MSG_ID}"
+
+        resp = requests.patch(
+            edit_url,
+            json={"embeds": [embed]},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            log(f"  [OK] Dashboard message updated.")
+        else:
+            log(f"  [WARN] Dashboard update: {resp.status_code} - {resp.text[:100]}")
+    except Exception as e:
+        log(f"  [WARN] Dashboard update error: {type(e).__name__}: {e}")
+
+
+def run_dry_test():
+    """Test all external connections without generating anything."""
+    log("=== DRY RUN — Testing connections ===")
+    errors = 0
+
+    # 1. Wireproxy
+    log("[1/5] Wireproxy tunnel...")
+    if start_wireproxy():
+        log("  [OK] Wireproxy is active")
+    else:
+        log("  [SKIP] Wireproxy not configured or failed")
+
+    # 2. OpenAI API
+    log("[2/5] OpenAI API connections...")
+    for name, c in [("client1", client1), ("client2", client2)]:
+        if c is None:
+            log(f"  [SKIP] {name} — no API key")
+            continue
+        for model in (PREMIUM_MODEL, MINI_MODEL):
+            try:
+                c.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": "test"}],
+                    max_completion_tokens=5,
+                )
+                log(f"  [OK] {name} ({model})")
+            except Exception as e:
+                log(f"  [ERR] {name} ({model}) - {type(e).__name__}: {e}")
+                errors += 1
+
+    # 3. RSS feeds
+    log("[3/5] RSS feeds...")
+    ok_feeds = 0
+    for url in RSS_FEEDS:
+        source = _get_domain(url)
+        try:
+            headers = _random_headers(url)
+            res = SESSION.get(url, headers=headers, timeout=SCRAPE_TIMEOUT)
+            feed = feedparser.parse(res.content)
+            log(f"  [OK] {source}: {len(feed.entries)} entries")
+            ok_feeds += 1
+        except Exception as e:
+            log(f"  [ERR] {source}: {type(e).__name__}: {e}")
+            errors += 1
+    log(f"  [INFO] {ok_feeds}/{len(RSS_FEEDS)} feeds accessible")
+
+    # 4. Test scraping a few articles (one per approach)
+    log("[4/5] Test scraping (one direct, one via proxy)...")
+    test_urls = [
+        ("https://www.denik.cz/", "direct"),
+        ("https://www.irozhlas.cz/", "proxy"),
+    ]
+    for url, method in test_urls:
+        try:
+            headers = _random_headers(url)
+            if method == "proxy" and _wireproxy_active:
+                proxies = {"http": PROXY_URL, "https": PROXY_URL}
+                res = SESSION.get(url, headers=headers, timeout=SCRAPE_TIMEOUT, proxies=proxies)
+            else:
+                res = SESSION.get(url, headers=headers, timeout=SCRAPE_TIMEOUT)
+            log(f"  [OK] {_get_domain(url)} ({method}): HTTP {res.status_code}")
+        except Exception as e:
+            log(f"  [ERR] {_get_domain(url)} ({method}): {type(e).__name__}: {e}")
+            errors += 1
+
+    # 5. Vyzyvatel API
+    log("[5/5] Vyzyvatel API...")
+    if VYZYVATEL_API_KEY:
+        try:
+            vyz_url = f"https://be.vyzyvatel.com/api/sets/{VYZYVATEL_SET_ID}/questions"
+            headers = {"Authorization": f"Bearer {VYZYVATEL_API_KEY}"}
+            res = requests.get(vyz_url, headers=headers, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                q_count = len(data) if isinstance(data, list) else len(data.get("questions", []))
+                log(f"  [OK] Vyzyvatel: {q_count} questions in set {VYZYVATEL_SET_ID}")
+            else:
+                log(f"  [ERR] Vyzyvatel: HTTP {res.status_code}")
+                errors += 1
+        except Exception as e:
+            log(f"  [ERR] Vyzyvatel: {type(e).__name__}: {e}")
+            errors += 1
+    else:
+        log("  [SKIP] No VYZYVATEL_API_KEY")
+
+    # Summary
+    log(f"\n=== DRY RUN COMPLETE — {errors} error(s) ===")
+    if errors == 0:
+        log("All systems operational. Ready for production.")
+    else:
+        log(f"Fix {errors} error(s) before deploying.")
+
+    return errors
+
+
+SCHEDULE_HOUR = 11      # Pipeline starts at 11:00 Prague time
+SCHEDULE_MINUTE = 0
 PUBLISH_HOUR = 12       # Upload to Vyzyvatel at 12:00 Prague time
 PUBLISH_MINUTE = 0
 STATS_FILE = os.path.join(OUTPUT_DIR, "pipeline_stats.json")
@@ -1302,8 +1908,24 @@ def run_pipeline():
     questions = []
     pipeline_start = time.time()
 
+    # Reset mini token tracking for this run
+    _mini_token_usage["client1"] = 0
+    _mini_token_usage["client2"] = 0
+
+    # Cleanup old debug files (>7 days)
+    for f in os.listdir(OUTPUT_DIR):
+        if f.startswith("debug_"):
+            path = os.path.join(OUTPUT_DIR, f)
+            try:
+                if os.path.getmtime(path) < time.time() - 7 * 86400:
+                    os.remove(path)
+            except OSError:
+                pass
+
     log(f"=== Daily Quiz Pipeline - {today} ===")
     log(f"Debug log: {DEBUG_LOG_FILE}")
+    log(f"Config: schedule={SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d}, publish={PUBLISH_HOUR:02d}:{PUBLISH_MINUTE:02d}, "
+        f"feeds={len(RSS_FEEDS)}, budget={PREMIUM_TOKEN_BUDGET:,}/key, proxy={'yes' if WG_CONF_BASE64 else 'no'}")
     
     # Load and show historical stats
     stats = _load_stats()
@@ -1426,16 +2048,23 @@ def run_pipeline():
     
     # Send Discord notification
     send_discord_report(timings, questions, error_count, dict(_scrape_errors), fact_count, category_count)
-    
+
+    # Update persistent dashboard message
+    update_discord_dashboard(stats)
+
     log(f"=== Completed at {datetime.now(PRAGUE_TZ).strftime('%H:%M:%S')} Prague time ===")
 
 
-# Main Execution
 if __name__ == "__main__":
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     log(f"=== Quiz Scheduler Started ===")
     log(f"Schedule: pipeline at {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d}, publish at {PUBLISH_HOUR:02d}:{PUBLISH_MINUTE:02d} Prague time")
+
+    # Dry-run mode — test all connections and exit
+    if DRY_RUN:
+        exit_code = run_dry_test()
+        exit(exit_code)
 
     def _today_lockfile() -> str:
         return os.path.join(OUTPUT_DIR, f".last_run_{datetime.now(PRAGUE_TZ).strftime('%Y-%m-%d')}")
@@ -1452,18 +2081,8 @@ if __name__ == "__main__":
                 except OSError:
                     pass
 
-    # Run immediately on first start — but only if not already done today
-    if _already_ran_today():
-        log(f"  [INFO] Already ran today (lockfile exists). Skipping to scheduler.")
-    else:
-        try:
-            run_pipeline()
-            _mark_ran_today()
-        except KeyboardInterrupt:
-            log("\n[WARN] Interrupted by user.")
-            exit(130)
-        except Exception as e:
-            log(f"[FATAL] Pipeline error: {type(e).__name__}: {e}")
+    # No run-on-deploy — always wait for scheduled time
+    log(f"  [INFO] Waiting for scheduled time. No run-on-deploy.")
 
     # Infinite scheduler loop
     while True:
@@ -1473,8 +2092,15 @@ if __name__ == "__main__":
 
         try:
             time.sleep(max(0, wait_seconds))
-            run_pipeline()
+
+            # Double-check lockfile in case of NTP drift, signal resume, etc.
+            if _already_ran_today():
+                log(f"  [INFO] Already ran today (lockfile exists). Skipping.")
+                continue
+
+            # Create lockfile BEFORE running — prevents re-runs on crash/restart
             _mark_ran_today()
+            run_pipeline()
         except KeyboardInterrupt:
             log("\n[WARN] Interrupted by user.")
             exit(130)

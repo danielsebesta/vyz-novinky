@@ -1,0 +1,6 @@
+.env
+daily_questions/
+__pycache__/
+*.pyc
+*.pyo
+wg.conf

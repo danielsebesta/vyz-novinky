@@ -269,7 +269,8 @@ def is_recent(entry, cutoff: datetime) -> bool:
     """Check if the article was published after the cutoff time."""
     dt = get_entry_date(entry)
     if dt is None:
-        return False
+        # No date available (e.g. denikn.cz) — assume recent since it's in the feed
+        return True
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt >= cutoff

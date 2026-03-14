@@ -350,10 +350,10 @@ def start_wireproxy() -> bool:
 
     log("  [INFO] Starting wireproxy tunnel...")
     try:
-        subprocess.run(["pkill", "/usr/local/bin/wireproxy"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["pkill", "wireproxy"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(1)
         subprocess.Popen(
-            ["/usr/local/bin/wireproxy", "-c", WG_CONF_FILE],
+            ["wireproxy", "-c", WG_CONF_FILE],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
     except FileNotFoundError:

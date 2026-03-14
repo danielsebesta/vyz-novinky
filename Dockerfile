@@ -11,7 +11,7 @@ RUN apt-get update && \
 
 # Install wireproxy for Cloudflare WARP SOCKS5 fallback
 RUN ARCH=$(dpkg --print-architecture) && \
-    curl -fsSL "https://github.com/pufferffish/wireproxy/releases/download/v1.0.9/wireproxy_linux_${ARCH}.tar.gz" \
+    curl -fsSL "https://github.com/windtf/wireproxy/releases/download/v1.1.2/wireproxy_linux_${ARCH}.tar.gz" \
     | tar -xz -C /usr/local/bin/ wireproxy && \
     chmod +x /usr/local/bin/wireproxy
 

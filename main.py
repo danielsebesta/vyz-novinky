@@ -2083,8 +2083,10 @@ if __name__ == "__main__":
 
     # Dry-run mode — test all connections and exit
     if DRY_RUN:
-        exit_code = run_dry_test()
-        exit(exit_code)
+        run_dry_test()
+        log("Dry run complete. Container idle — disable DRY_RUN and redeploy for production.")
+        while True:
+            time.sleep(86400)
 
     def _today_lockfile() -> str:
         return os.path.join(OUTPUT_DIR, f".last_run_{datetime.now(PRAGUE_TZ).strftime('%Y-%m-%d')}")

@@ -1,40 +1,42 @@
-# Denni Kvizove Otazky
+# Novinky z ČR a světa
 
-Automated pipeline that scrapes Czech news daily, extracts facts, and generates 40 quiz questions for [Vyzyvatel](https://vyzyvatel.com).
+Python skript pro neustále aktualizovanou sadu otázek o aktuálním dění do hry [Vyzyvatel.com](https://vyzyvatel.com). Data z 20+ webů zpracovávají modely GPT-5-Mini a GPT-5.4.
 
-## How it works
+**Sada:** [Novinky z ČR a světa](https://vyzyvatel.com/dashboard/sets/5402)
 
-The pipeline runs daily at a scheduled time (default 11:00 Prague time) and goes through 6 steps:
+## Jak to funguje
 
-1. **Scraping** — fetches articles from 25 Czech news RSS feeds with per-domain rate limiting, User-Agent rotation, and optional SOCKS5 proxy fallback via Cloudflare WARP
-2. **Fact extraction** — gpt-5-mini extracts concrete facts (numbers, names, places, results)
-3. **Categorization** — hybrid approach: Python keyword matching for ~80% of facts, gpt-5-mini for the rest. 8 categories (politics, sport, economy, tech, culture, science, society, world)
-4. **Question generation** — gpt-5.4 creates 20 multiple-choice + 20 number questions with validation, deduplication, and backfill
-5. **Upload** — sends questions to Vyzyvatel API at publish time (default 12:00)
-6. **Cleanup** — deletes questions older than 7 days
+Pipeline se spouští každý den v naplánovaný čas (výchozí 11:00 CET) a prochází 6 kroky:
 
-## Requirements
+1. **Scraping** — stáhne články z 25 českých zpravodajských RSS feedů s rate limitingem per doména, rotací User-Agent a volitelným SOCKS5 proxy přes Cloudflare WARP
+2. **Extrakce faktů** — GPT-5-Mini vytáhne konkrétní fakta (čísla, jména, místa, výsledky)
+3. **Kategorizace** — hybridní přístup: Python keyword matching pro ~80 % faktů, GPT-5-Mini pro zbytek. 8 kategorií (politika, sport, ekonomika, technologie, kultura, věda, společnost, svět)
+4. **Generování otázek** — GPT-5.4 vytvoří 20 výběrových + 20 číselných otázek s validací, deduplikací a backfillem
+5. **Upload** — ve 12:00 odešle otázky do Vyzyvatel API
+6. **Cleanup** — smaže otázky starší než 7 dní
+
+## Požadavky
 
 - Docker
-- OpenAI API key(s) with free tier access
-- Vyzyvatel API key + set ID
-- (optional) Discord webhook for notifications
-- (optional) Cloudflare WARP config for proxy fallback
+- OpenAI API klíč(e) s free tier přístupem
+- Vyzyvatel API klíč + ID sady
+- (volitelně) Discord webhook pro notifikace
+- (volitelně) Cloudflare WARP config pro proxy fallback
 
 ## Environment variables
 
-| Variable | Required | Description |
+| Proměnná | Povinná | Popis |
 |---|---|---|
-| `OPENAI_API_KEY` | Yes | Primary OpenAI API key |
-| `OPENAI_API_KEY2` | No | Secondary API key for token budget distribution |
-| `VYZYVATEL_API_KEY` | Yes | Vyzyvatel API key |
-| `VYZYVATEL_SET_ID` | Yes | Question set ID |
-| `DISCORD_WEBHOOK_URL` | No | Discord webhook for daily reports |
-| `DISCORD_DASHBOARD_MSG_ID` | No | Discord message ID to edit with stats dashboard |
-| `WG_CONF_BASE64` | No | Base64-encoded WireGuard/WARP config for proxy fallback |
-| `DRY_RUN` | No | Set to `true` to test all connections without generating |
+| `OPENAI_API_KEY` | Ano | Primární OpenAI API klíč |
+| `OPENAI_API_KEY2` | Ne | Sekundární API klíč pro rozložení token budgetu |
+| `VYZYVATEL_API_KEY` | Ano | Vyzyvatel API klíč |
+| `VYZYVATEL_SET_ID` | Ano | ID sady otázek |
+| `DISCORD_WEBHOOK_URL` | Ne | Discord webhook pro denní reporty |
+| `DISCORD_DASHBOARD_MSG_ID` | Ne | ID Discord zprávy pro live dashboard |
+| `WG_CONF_BASE64` | Ne | Base64-encoded WireGuard/WARP config pro proxy fallback |
+| `DRY_RUN` | Ne | `true` pro otestování všech připojení bez generování |
 
-## Quick start
+## Spuštění
 
 ```bash
 docker build -t daily-quiz .
@@ -51,21 +53,21 @@ docker run -d \
 
 ## Dry run
 
-Test all connections without generating anything:
+Otestuje všechna připojení bez generování otázek:
 
 ```bash
 docker run --rm -e DRY_RUN=true -e OPENAI_API_KEY=... daily-quiz
 ```
 
-This tests: wireproxy tunnel, OpenAI API keys, all RSS feeds, scraping (direct + proxy), and Vyzyvatel API.
+Testuje: wireproxy tunel, OpenAI API klíče, všechny RSS feedy, scraping (přímý + proxy) a Vyzyvatel API.
 
-## Cost
+## Náklady
 
-Designed to stay within OpenAI free tier limits with 2 API keys:
+Navrženo pro provoz v rámci OpenAI free tier limitů se 2 API klíči:
 
-- gpt-5-mini: ~100K-300K / 2.5M tokens per key per day
-- gpt-5.4: ~55K-160K / 250K tokens per key per day
+- GPT-5-Mini: ~100K–300K / 2.5M tokenů na klíč denně
+- GPT-5.4: ~55K–160K / 250K tokenů na klíč denně
 
-## License
+## Licence
 
 MIT

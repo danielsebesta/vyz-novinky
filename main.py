@@ -337,12 +337,16 @@ def start_wireproxy() -> bool:
         return False
 
     log("  [INFO] Starting wireproxy tunnel...")
-    subprocess.run(["pkill", "wireproxy"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(1)
-    subprocess.Popen(
-        ["wireproxy", "-c", WG_CONF_FILE],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
+    try:
+        subprocess.run(["pkill", "wireproxy"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1)
+        subprocess.Popen(
+            ["wireproxy", "-c", WG_CONF_FILE],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    except FileNotFoundError:
+        log("  [WARN] wireproxy binary not found, proxy fallback disabled")
+        return False
 
     for _ in range(15):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:

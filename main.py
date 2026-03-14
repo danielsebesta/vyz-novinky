@@ -359,15 +359,17 @@ def start_wireproxy() -> bool:
         pass
     time.sleep(1)
     try:
+        wp_log = os.path.join(OUTPUT_DIR, "wireproxy.log")
+        wp_err = open(wp_log, "w")
         subprocess.Popen(
             ["wireproxy", "-c", WG_CONF_FILE],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            stdout=wp_err, stderr=wp_err
         )
     except FileNotFoundError:
         log("  [WARN] wireproxy binary not found, proxy fallback disabled")
         return False
 
-    for _ in range(15):
+    for i in range(15):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             if s.connect_ex((PROXY_HOST, PROXY_PORT)) == 0:
                 try:
@@ -380,6 +382,15 @@ def start_wireproxy() -> bool:
                 return True
         time.sleep(1)
 
+    # Dump wireproxy output for debugging
+    try:
+        with open(os.path.join(OUTPUT_DIR, "wireproxy.log"), "r") as f:
+            wp_output = f.read().strip()
+        if wp_output:
+            for line in wp_output.split("\n")[:10]:
+                log(f"  [WIREPROXY] {line}")
+    except Exception:
+        pass
     log("  [WARN] Wireproxy failed to start within 15s")
     return False
 

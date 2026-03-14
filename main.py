@@ -37,6 +37,8 @@ RSS_FEEDS = [
     "https://cnn.iprima.cz/rss",
     "https://ct24.ceskatelevize.cz/rss",
     "https://www.irozhlas.cz/rss/irozhlas",
+    "https://www.irozhlas.cz/rss/irozhlas/section/zpravy-svet",
+    "https://www.irozhlas.cz/rss/irozhlas/section/zpravy-domov",
     "https://www.denik.cz/rss/zpravy.html",
     "https://servis.idnes.cz/rss.aspx?c=zpravodaj",
     "https://zpravy.aktualne.cz/rss/?lp=1",
@@ -247,8 +249,17 @@ def get_entry_date(entry) -> datetime | None:
     for field in ("published", "updated"):
         raw = entry.get(field, "")
         if raw:
+            # Try RFC 2822 first (most RSS feeds)
             try:
                 return parsedate_to_datetime(raw)
+            except Exception:
+                pass
+            # Try ISO 8601 (tyden.cz, info.cz, some others)
+            try:
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
             except Exception:
                 pass
     return None
@@ -502,8 +513,10 @@ def fetch_daily_news() -> str:
     for url in RSS_FEEDS:
         source = url.split("/")[2]
         try:
-            headers = _random_headers(url)
-            res = SESSION.get(url, headers=headers, timeout=SCRAPE_TIMEOUT)
+            res = SESSION.get(url, timeout=SCRAPE_TIMEOUT, headers={
+                "User-Agent": random.choice(USER_AGENTS),
+                "Accept": "application/rss+xml, application/xml, text/xml, */*",
+            })
             feed = feedparser.parse(res.content)
             recent = [e for e in feed.entries if is_recent(e, cutoff)]
             if MAX_ENTRIES_PER_FEED:
@@ -1758,8 +1771,10 @@ def run_dry_test():
     for url in RSS_FEEDS:
         source = _get_domain(url)
         try:
-            headers = _random_headers(url)
-            res = SESSION.get(url, headers=headers, timeout=SCRAPE_TIMEOUT)
+            res = SESSION.get(url, timeout=SCRAPE_TIMEOUT, headers={
+                "User-Agent": random.choice(USER_AGENTS),
+                "Accept": "application/rss+xml, application/xml, text/xml, */*",
+            })
             feed = feedparser.parse(res.content)
             log(f"  [OK] {source}: {len(feed.entries)} entries")
             ok_feeds += 1

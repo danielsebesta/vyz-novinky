@@ -8,9 +8,7 @@ RUN apt-get update && \
     echo $TZ > /etc/timezone && \
     rm -rf /var/lib/apt/lists/*
 
-RUN curl -L https://github.com/pufferffish/wireproxy/releases/download/v1.0.9/wireproxy_linux_amd64.tar.gz | tar xz -C /usr/local/bin/ && \
-    ls -la /usr/local/bin/wireproxy && \
-    /usr/local/bin/wireproxy --help || true
+RUN curl -L https://github.com/pufferffish/wireproxy/releases/download/v1.0.9/wireproxy_linux_amd64.tar.gz | tar xz -C /usr/local/bin/
 
 WORKDIR /app
 

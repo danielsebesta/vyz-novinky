@@ -349,12 +349,12 @@ def start_wireproxy() -> bool:
         return False
 
     log("  [INFO] Starting wireproxy tunnel...")
-    import shutil
-    wp_path = shutil.which("wireproxy")
-    log(f"  [DEBUG] wireproxy which: {wp_path}, PATH: {os.environ.get('PATH', 'unset')}")
     try:
-        subprocess.run(["pkill", "wireproxy"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(1)
+        subprocess.run(["killall", "wireproxy"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        pass
+    time.sleep(1)
+    try:
         subprocess.Popen(
             ["wireproxy", "-c", WG_CONF_FILE],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
